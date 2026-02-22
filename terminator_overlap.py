@@ -1,56 +1,16 @@
 #!/usr/bin/env python3
 import argparse
-import csv
 import logging
 import math
-import os
 import random
-import re
 import subprocess
-import sys
-import tempfile
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
 from Bio import SeqIO
-from intervaltree import Interval, IntervalTree
-
-
-@dataclass(frozen=True)
-class BlastHit:
-    qseqid: str
-    sseqid: str
-    sstart: int
-    send: int
-    bitscore: float
-    evalue: float
-
-_ACCESSION_LIKE = re.compile(r"^[A-Za-z]{1,3}_?\d+(?:\.\d+)?$")
-
-def subject_key_candidates(sseqid: str):
-    """
-    Produce lookup keys in the requested order:
-    - If sseqid has no explicit version, try '.1' first then unversioned.
-    - If sseqid has a version, try as-is first then strip version.
-    Also strips common BLAST decorations like 'ref|...|' by taking the last
-    pipe-delimited token that looks like an accession.
-    """
-    raw = sseqid.split()[0]  # drop any trailing description
-
-    token = raw
-    if "|" in raw:
-        # choose a pipe field that looks accession-like, prefer with version if present
-        fields = [f for f in raw.split("|") if f]
-        acc_like = [f for f in fields if _ACCESSION_LIKE.match(f)]
-        token = acc_like[-1] if acc_like else fields[-1]
-
-    if "." in token:
-        base = token.rsplit(".", 1)[0]
-        return [token, base]
-    else:
-        return [f"{token}.1", token]
+from intervaltree import IntervalTree
 
 
 def run_cmd(cmd, *, text=True):
@@ -63,11 +23,50 @@ def run_cmd(cmd, *, text=True):
     return p.stdout
 
 
+def prefer_dot1_candidates(genome_id: str):
+    """
+    Always try '.1' first, then unversioned.
+    - If input is AB930127      -> [AB930127.1, AB930127]
+    - If input is AB930127.1    -> [AB930127.1, AB930127]
+    """
+    g = genome_id.strip()
+    if not g:
+        return []
+    if "." in g:
+        base = g.rsplit(".", 1)[0]
+        return [f"{base}.1", base]
+    else:
+        return [f"{g}.1", g]
+
+
+def parse_fasta_header(record_id: str):
+    """
+    Accept:
+      CP047845_1576955-1577393
+      CP047845_1576955_1577393  (fallback)
+    genomename may contain underscores; we split on the last '_' and parse coords.
+    """
+    if "_" not in record_id:
+        raise ValueError(f"FASTA id missing '_' before coordinates: {record_id}")
+    genome, coord_part = record_id.rsplit("_", 1)
+
+    if "-" in coord_part:
+        a, b = coord_part.split("-", 1)
+    elif "_" in coord_part:
+        a, b = coord_part.split("_", 1)
+    else:
+        raise ValueError(f"FASTA id coordinate part must contain '-' or '_': {record_id}")
+
+    start = int(a)
+    end = int(b)
+    return genome, min(start, end), max(start, end)
+
+
 def parse_samplename(sample_name: str):
     """
-    SampleName format:
+    SampleName:
       index_genomename_upstreamend_downstreamend_strand
-    where strand is +/-, and genomename may contain underscores.
+    where strand is + or -, and genomename may contain underscores.
     """
     parts = sample_name.split("_")
     if len(parts) < 5:
@@ -84,59 +83,34 @@ def parse_samplename(sample_name: str):
     return idx, genome, start, end, strand
 
 
-def parse_fasta_header(record_id: str):
+def load_predicted_intervals(mean_csv: Path, threshold: float):
     """
-    Accept:
-      CP047845_1576955-1577393
-      CP047845_1576955_1577393
-    where genome may contain underscores (we split on the last '_' then parse coords).
+    Returns:
+      tree: IntervalTree with merged predicted intervals (half-open)
+      pred_total_bp: total bp covered by predicted intervals (after merging)
+      n_rows_kept: number of rows kept after threshold filter
     """
-    if "_" not in record_id:
-        raise ValueError(f"FASTA id missing '_' before coordinates: {record_id}")
+    df = pd.read_csv(mean_csv)
+    if "SampleName" not in df.columns or "probability_mean" not in df.columns:
+        raise ValueError(f"{mean_csv} missing required columns SampleName/probability_mean")
 
-    genome, coord_part = record_id.rsplit("_", 1)
+    df["probability_mean"] = df["probability_mean"].astype(float)
+    df = df[df["probability_mean"] >= threshold].copy()
 
-    # coord_part could be "start-end" or (rarely) "start_end" if someone used underscores
-    if "-" in coord_part:
-        a, b = coord_part.split("-", 1)
-    elif "_" in coord_part:
-        a, b = coord_part.split("_", 1)
-    else:
-        raise ValueError(f"FASTA id coordinate part must contain '-' or '_': {record_id}")
+    tree = IntervalTree()
+    for sn in df["SampleName"].astype(str).tolist():
+        _, _, s, e, _ = parse_samplename(sn)
+        tree.addi(s, e + 1)  # store as half-open [s, e+1)
 
-    start = int(a)
-    end = int(b)
-    return genome, min(start, end), max(start, end)
+    tree.merge_overlaps(strict=False)
 
-
-
-def to_intervaltree(df: pd.DataFrame):
-    """
-    Build IntervalTrees keyed by genome/contig name.
-    Uses half-open intervals [start, end+1) to represent inclusive coordinates.
-    """
-    trees = defaultdict(IntervalTree)
-    for _, row in df.iterrows():
-        genome = row["Genome"]
-        start = int(row["Start"])
-        end = int(row["End"])
-        trees[genome].addi(start, end + 1, row["probability_mean"])
-    for g in list(trees.keys()):
-        trees[g].merge_overlaps(strict=False)
-    return trees
-
-
-def interval_len(iv: Interval):
-    return int(iv.end - iv.begin)
+    pred_total_bp = sum((iv.end - iv.begin) for iv in tree)
+    return tree, int(pred_total_bp), int(len(df))
 
 
 def overlap_bp(tree: IntervalTree, start_inclusive: int, end_inclusive: int):
-    """
-    Compute total bp overlap between merged intervals in tree and a query interval [start,end] inclusive.
-    tree intervals are half-open.
-    """
-    q0 = start_inclusive
-    q1 = end_inclusive + 1
+    q0 = int(start_inclusive)
+    q1 = int(end_inclusive) + 1
     if q1 <= q0:
         return 0
     total = 0
@@ -148,61 +122,13 @@ def overlap_bp(tree: IntervalTree, start_inclusive: int, end_inclusive: int):
     return int(total)
 
 
-def total_bp(tree: IntervalTree):
-    return int(sum(interval_len(iv) for iv in tree))
-
-
-def pick_best_hit(hits):
-    if not hits:
-        return None
-    # Prefer higher bitscore, then lower evalue, then longer span.
-    def key(h: BlastHit):
-        span = abs(h.send - h.sstart) + 1
-        return (h.bitscore, -math.log10(h.evalue + 1e-300), span)
-
-    return max(hits, key=key)
-
-
-def blast_all_queries(query_fasta: Path, blast_db: str, blastn: str, *, evalue: float,
-                      threads: int, task: str, max_target_seqs: int):
-    outfmt = "6 qseqid sseqid qstart qend sstart send evalue bitscore"
-    cmd = [
-        blastn,
-        "-query", str(query_fasta),
-        "-db", blast_db,
-        "-outfmt", outfmt,
-        "-evalue", str(evalue),
-        "-num_threads", str(threads),
-        "-task", task,
-        "-max_target_seqs", str(max_target_seqs),
-        "-max_hsps", "1",
-    ]
-    tsv = run_cmd(cmd)
-    per_q = defaultdict(list)
-    for line in tsv.splitlines():
-        if not line.strip():
-            continue
-        qseqid, sseqid, qstart, qend, sstart, send, evalue_s, bitscore_s = line.split("\t")
-        hit = BlastHit(
-            qseqid=qseqid,
-            sseqid=sseqid,
-            sstart=int(sstart),
-            send=int(send),
-            bitscore=float(bitscore_s),
-            evalue=float(evalue_s),
-        )
-        per_q[qseqid].append(hit)
-    return per_q
-
-
-def blastdb_seq_length(sseqid: str, blast_db: str, blastdbcmd: str):
-    # blastdbcmd custom outfmt supports %l for sequence length
-    cmd = [blastdbcmd, "-db", blast_db, "-entry", sseqid, "-outfmt", "%l"]
+def blastdb_length(blastdbcmd: str, blast_db: str, entry: str):
+    cmd = [blastdbcmd, "-db", blast_db, "-entry", entry, "-outfmt", "%l"]
     out = run_cmd(cmd).strip()
     try:
         return int(out)
     except ValueError:
-        raise RuntimeError(f"Could not parse blastdbcmd length for {sseqid}: {out!r}")
+        raise RuntimeError(f"Could not parse blastdbcmd length for entry={entry!r}: {out!r}")
 
 
 def compute_percent(overlap: int, denom_bp: int):
@@ -213,167 +139,146 @@ def compute_percent(overlap: int, denom_bp: int):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Filter predicted terminators, BLAST query sequences, and compute overlap vs BLAST-hit genomic intervals."
+        description="Compute overlap between per-genome predicted terminators (mean.csv) and FASTA regions; includes random-region control."
     )
-    ap.add_argument("--pred-csv", required=True, help="CSV with header SampleName,probability_ENAC,probability_PS2,probability_NCP,probability_binary,probability_mean")
-    ap.add_argument("--query-fasta", required=True, help="Multi-FASTA: >genomename_start_end then sequence in AUGC (U will be converted to T for BLAST)")
-    ap.add_argument("--blast-db", required=True, help="Local BLAST DB prefix (as used with -db)")
+    ap.add_argument("--query-fasta", required=True, help="Multi-FASTA with headers like >GENOME_start-end (sequence can be AUGC and include '-')")
+    ap.add_argument("--mean-root", required=True, help="Root directory containing per-genome folders, e.g. output/GENOME/GENOME_mean.csv")
+    ap.add_argument("--mean-suffix", default="_mean.csv", help="Suffix for mean CSV files (default: _mean.csv)")
     ap.add_argument("--threshold", type=float, default=0.3, help="Keep rows with probability_mean >= threshold (default: 0.3)")
-    ap.add_argument("--out-prefix", required=True, help="Prefix for output files (TSV + optional PNG)")
-    ap.add_argument("--plot", action="store_true", help="Create a plot (PNG) of observed overlap vs random control")
+    ap.add_argument("--blast-db", required=True, help="Local BLAST DB prefix used with blastdbcmd -db")
+    ap.add_argument("--blastdbcmd", default="blastdbcmd", help="Path to blastdbcmd (default: blastdbcmd in PATH)")
+    ap.add_argument("--overlap-denom", choices=["predicted", "region", "union"], default="predicted",
+                    help="Denominator for percent overlap (default: predicted)")
     ap.add_argument("--random-n", type=int, default=200, help="Random control iterations per query (default: 200)")
     ap.add_argument("--seed", type=int, default=1, help="RNG seed for random control (default: 1)")
-    ap.add_argument("--overlap-denom", choices=["predicted", "blast", "union"], default="predicted",
-                    help="Denominator for reported percent overlap (default: predicted)")
-    ap.add_argument("--blastn", default="blastn", help="Path to blastn (default: blastn in PATH)")
-    ap.add_argument("--blastdbcmd", default="blastdbcmd", help="Path to blastdbcmd (default: blastdbcmd in PATH)")
-    ap.add_argument("--evalue", type=float, default=1e-5, help="BLAST e-value cutoff (default: 1e-5)")
-    ap.add_argument("--threads", type=int, default=4, help="BLAST threads (default: 4)")
-    ap.add_argument("--task", default="blastn", help="BLAST task, e.g. blastn or blastn-short (default: blastn)")
-    ap.add_argument("--max-target-seqs", type=int, default=50, help="BLAST -max_target_seqs (default: 50)")
-    ap.add_argument("--subject-id-regex", default=None,
-                    help="Optional regex with one capture group to map BLAST sseqid -> genome key used in CSV. Example: '^([^|]+)\\|'")
+    ap.add_argument("--plot", action="store_true", help="Write a PNG plot of observed overlap vs random control")
+    ap.add_argument("--out-prefix", required=True, help="Prefix for output files (TSV + optional PNG)")
     ap.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = ap.parse_args()
 
     logging.basicConfig(level=getattr(logging, args.log_level), format="%(levelname)s: %(message)s")
     random.seed(args.seed)
 
-    pred = pd.read_csv(args.pred_csv)
-    required = ["SampleName", "probability_mean"]
-    missing = [c for c in required if c not in pred.columns]
-    if missing:
-        raise ValueError(f"Missing required columns in pred-csv: {missing}")
+    mean_root = Path(args.mean_root)
+    out_prefix = Path(args.out_prefix)
+    out_prefix.parent.mkdir(parents=True, exist_ok=True)
 
-    pred = pred[pred["probability_mean"].astype(float) >= args.threshold].copy()
-
-    parsed_rows = []
-    for sn, pm in zip(pred["SampleName"].astype(str), pred["probability_mean"].astype(float)):
-        idx, genome, start, end, strand = parse_samplename(sn)
-        parsed_rows.append((sn, idx, genome, start, end, strand, float(pm)))
-
-    pred2 = pd.DataFrame(parsed_rows, columns=["SampleName", "Index", "Genome", "Start", "End", "Strand", "probability_mean"])
-    trees = to_intervaltree(pred2)
-
-    # Write all queries to a temp fasta with U->T conversion for blastn
-    query_records = list(SeqIO.parse(args.query_fasta, "fasta"))
-    if not query_records:
-        raise ValueError("No sequences found in query-fasta")
-
-    with tempfile.TemporaryDirectory() as td:
-        qfa = Path(td) / "queries_for_blast.fa"
-        with qfa.open("w") as fh:
-            for rec in query_records:
-                seq = str(rec.seq).upper().replace("-", "").replace("U", "T")
-                fh.write(f">{rec.id}\n{seq}\n")
-
-        per_q_hits = blast_all_queries(
-            qfa,
-            args.blast_db,
-            args.blastn,
-            evalue=args.evalue,
-            threads=args.threads,
-            task=args.task,
-            max_target_seqs=args.max_target_seqs,
-        )
-
-    subj_map_re = re.compile(args.subject_id_regex) if args.subject_id_regex else None
+    # Caches
+    interval_cache = {}  # genome_key_used -> (tree, pred_total_bp, n_rows_kept, mean_csv_path)
+    length_cache = {}    # blast_entry_used -> length
 
     results = []
     random_rows = []
 
-    subj_len_cache = {}
+    records = list(SeqIO.parse(args.query_fasta, "fasta"))
+    if not records:
+        raise ValueError("No sequences found in --query-fasta")
 
-    for rec in query_records:
+    for rec in records:
         qid = rec.id
-        q_genome, q_start, q_end = parse_fasta_header(qid)
-        hits = per_q_hits.get(qid, [])
-        best = pick_best_hit(hits)
+        genome_raw, region_start, region_end = parse_fasta_header(qid)
+        region_len = region_end - region_start + 1
 
-        if best is None:
+        # Find mean.csv by trying .1 first, then base.
+        mean_candidates = []
+        genome_candidates = prefer_dot1_candidates(genome_raw)
+        for g in genome_candidates:
+            mean_candidates.append(mean_root / g / f"{g}{args.mean_suffix}")
+
+        mean_csv = None
+        genome_key_used = None
+        for g, p in zip(genome_candidates, mean_candidates):
+            if p.exists():
+                mean_csv = p
+                genome_key_used = g
+                break
+
+        if mean_csv is None:
             results.append({
                 "qseqid": qid,
-                "query_genome": q_genome,
-                "query_start": q_start,
-                "query_end": q_end,
-                "blast_sseqid": None,
-                "blast_start": None,
-                "blast_end": None,
-                "blast_len": None,
-                "predicted_total_bp_in_subject": None,
+                "genome_from_fasta": genome_raw,
+                "genome_key_used": None,
+                "mean_csv": None,
+                "region_start": region_start,
+                "region_end": region_end,
+                "region_len": region_len,
+                "pred_rows_kept": None,
+                "predicted_total_bp": None,
                 "overlap_bp": 0,
                 "percent_overlap": float("nan"),
                 "random_mean_percent": float("nan"),
                 "random_sd_percent": float("nan"),
-                "note": "No BLAST hits passing filters (or BLAST produced no output lines)."
+                "note": f"mean.csv not found under {mean_root} for candidates: {', '.join(str(x) for x in mean_candidates)}"
             })
             continue
 
-        sseqid = best.sseqid
-        s0 = min(best.sstart, best.send)
-        s1 = max(best.sstart, best.send)
-        blast_len = s1 - s0 + 1
+        # Load / cache predicted intervals for this genome_key_used
+        if genome_key_used not in interval_cache:
+            tree, pred_total_bp, n_rows_kept = load_predicted_intervals(mean_csv, args.threshold)
+            interval_cache[genome_key_used] = (tree, pred_total_bp, n_rows_kept, str(mean_csv))
+        tree, pred_total_bp, n_rows_kept, mean_csv_str = interval_cache[genome_key_used]
 
-        # Map sseqid -> genome key used for predicted terminators
-        if subj_map_re:
-            m = subj_map_re.search(sseqid)
-            if not m:
-                raise ValueError(f"--subject-id-regex did not match sseqid={sseqid!r}")
-            subject_candidates = [m.group(1)]
-        else:
-            subject_candidates = subject_key_candidates(sseqid)
-
-        tree = None
-        subject_key_used = None
-        for k in subject_candidates:
-            if k in trees:
-                tree = trees[k]
-                subject_key_used = k
-                break
-
-        if tree is None:
-            tree = IntervalTree()
-            subject_key_used = subject_candidates[0]  # for reporting only
-        pred_total = total_bp(tree)
-
-        ov = overlap_bp(tree, s0, s1)
+        ov = overlap_bp(tree, region_start, region_end)
 
         if args.overlap_denom == "predicted":
-            denom = pred_total
-        elif args.overlap_denom == "blast":
-            denom = blast_len
-        else:  # union (Jaccard-like denominator)
-            denom = pred_total + blast_len - ov
+            denom = pred_total_bp
+        elif args.overlap_denom == "region":
+            denom = region_len
+        else:  # union
+            denom = pred_total_bp + region_len - ov
 
         percent = compute_percent(ov, denom)
 
-        # Random control: same subject sequence, random interval of same length as BLAST interval
-        if sseqid not in subj_len_cache:
-            subj_len_cache[sseqid] = blastdb_seq_length(sseqid, args.blast_db, args.blastdbcmd)
-        subj_len = subj_len_cache[sseqid]
+        # Random control: sample intervals of same length from the genome sequence length in BLAST DB.
+        # Try same .1-first logic for blastdbcmd entry.
+        blast_entry_used = None
+        subj_len = None
+        blast_candidates = prefer_dot1_candidates(genome_raw)
+        for cand in blast_candidates:
+            if cand in length_cache:
+                blast_entry_used = cand
+                subj_len = length_cache[cand]
+                break
+
+        if subj_len is None:
+            for cand in blast_candidates:
+                try:
+                    subj_len = blastdb_length(args.blastdbcmd, args.blast_db, cand)
+                    length_cache[cand] = subj_len
+                    blast_entry_used = cand
+                    break
+                except Exception:
+                    continue
 
         rand_percents = []
-        if args.random_n > 0 and subj_len >= blast_len:
-            for i in range(args.random_n):
-                r_start = random.randint(1, subj_len - blast_len + 1)
-                r_end = r_start + blast_len - 1
-                rov = overlap_bp(tree, r_start, r_end)
-                if args.overlap_denom == "predicted":
-                    rden = pred_total
-                elif args.overlap_denom == "blast":
-                    rden = blast_len
-                else:
-                    rden = pred_total + blast_len - rov
-                rpercent = compute_percent(rov, rden)
-                rand_percents.append(rpercent)
-                random_rows.append({
-                    "qseqid": qid,
-                    "blast_sseqid": sseqid,
-                    "rand_start": r_start,
-                    "rand_end": r_end,
-                    "rand_overlap_bp": rov,
-                    "rand_percent_overlap": rpercent,
-                })
+        if subj_len is None:
+            note = "blastdbcmd length lookup failed for both .1 and unversioned genome id"
+        else:
+            note = ""
+            if args.random_n > 0 and subj_len >= region_len and region_len > 0:
+                for i in range(args.random_n):
+                    r_start = random.randint(1, subj_len - region_len + 1)
+                    r_end = r_start + region_len - 1
+                    rov = overlap_bp(tree, r_start, r_end)
+
+                    if args.overlap_denom == "predicted":
+                        rden = pred_total_bp
+                    elif args.overlap_denom == "region":
+                        rden = region_len
+                    else:
+                        rden = pred_total_bp + region_len - rov
+
+                    rpercent = compute_percent(rov, rden)
+                    rand_percents.append(rpercent)
+                    random_rows.append({
+                        "qseqid": qid,
+                        "genome_key_used": genome_key_used,
+                        "blast_entry_used": blast_entry_used,
+                        "rand_start": r_start,
+                        "rand_end": r_end,
+                        "rand_overlap_bp": rov,
+                        "rand_percent_overlap": rpercent
+                    })
 
         if rand_percents:
             mean_r = sum(rand_percents) / len(rand_percents)
@@ -384,24 +289,22 @@ def main():
 
         results.append({
             "qseqid": qid,
-            "query_genome": q_genome,
-            "query_start": q_start,
-            "query_end": q_end,
-            "blast_sseqid": sseqid,
-            "blast_start": s0,
-            "blast_end": s1,
-            "blast_len": blast_len,
-            "predicted_total_bp_in_subject": pred_total,
+            "genome_from_fasta": genome_raw,
+            "genome_key_used": genome_key_used,
+            "mean_csv": mean_csv_str,
+            "region_start": region_start,
+            "region_end": region_end,
+            "region_len": region_len,
+            "pred_rows_kept": n_rows_kept,
+            "predicted_total_bp": pred_total_bp,
             "overlap_bp": ov,
             "percent_overlap": percent,
             "random_mean_percent": mean_r,
             "random_sd_percent": sd_r,
-            "note": "",
-            "subject_key_used": subject_key_used
+            "blast_entry_used": blast_entry_used,
+            "blast_entry_len": subj_len,
+            "note": note
         })
-
-    out_prefix = Path(args.out_prefix)
-    out_prefix.parent.mkdir(parents=True, exist_ok=True)
 
     res_df = pd.DataFrame(results)
     res_path = out_prefix.with_suffix(".overlap.tsv")
@@ -411,24 +314,20 @@ def main():
     if random_rows:
         pd.DataFrame(random_rows).to_csv(rnd_path, sep="\t", index=False)
     else:
-        # still write an empty file with header for reproducibility
-        pd.DataFrame(columns=["qseqid","blast_sseqid","rand_start","rand_end","rand_overlap_bp","rand_percent_overlap"]).to_csv(
-            rnd_path, sep="\t", index=False
-        )
+        pd.DataFrame(columns=[
+            "qseqid","genome_key_used","blast_entry_used","rand_start","rand_end","rand_overlap_bp","rand_percent_overlap"
+        ]).to_csv(rnd_path, sep="\t", index=False)
 
     if args.plot:
         import matplotlib.pyplot as plt
 
         dfp = res_df.dropna(subset=["percent_overlap"]).copy()
-        dfp["label"] = dfp["qseqid"]
-
         fig_h = max(3.0, 0.35 * len(dfp) + 1.5)
         fig, ax = plt.subplots(figsize=(11, fig_h))
 
         y = list(range(len(dfp)))
         ax.barh(y, dfp["percent_overlap"].values, label="Observed", alpha=0.85)
 
-        # plot random mean as points with ±1 SD
         if dfp["random_mean_percent"].notna().any():
             ax.errorbar(
                 dfp["random_mean_percent"].values,
@@ -443,9 +342,9 @@ def main():
             )
 
         ax.set_yticks(y)
-        ax.set_yticklabels(dfp["label"].values)
+        ax.set_yticklabels(dfp["qseqid"].values)
         ax.set_xlabel(f"Percent overlap (denom={args.overlap_denom})")
-        ax.set_title("Predicted terminators vs BLAST-hit interval overlap")
+        ax.set_title("Predicted terminators vs FASTA region overlap")
         ax.grid(axis="x", linestyle=":", alpha=0.4)
         ax.legend(loc="lower right")
 
@@ -458,8 +357,6 @@ def main():
     logging.info("Wrote: %s", rnd_path)
     if args.plot:
         logging.info("Wrote: %s", out_prefix.with_suffix(".overlap.png"))
-
-
 
 
 if __name__ == "__main__":
