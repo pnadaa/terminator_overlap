@@ -27,6 +27,7 @@ def normalise_accession(acc: str) -> str:
 
 def parse_fasta_id(record_id: str) -> Tuple[str, int, int]:
     """Parse FASTA ID string to extract accession, start, and end coordinates."""
+    # Updated to match {accessionID}_{start}-{end}
     pattern = re.compile(r'^(.+)_(\d+)-(\d+)$')
     match = pattern.match(record_id)
     if not match:
@@ -66,21 +67,20 @@ def load_bactermfinder_windows(csv_path: Path) -> Tuple[pd.DataFrame, int]:
         return pd.DataFrame(columns=['win_start', 'win_end', 'strand', 'probability_mean']), 0
 
     valid_rows = []
-    pattern = re.compile(r'^(.+)_(\d+)_(\d+)_([+-])$')
+    # Updated regex to match format: windowID_accessionID_startcoordinate_endcoordinate_strand
+    # [^_]+ matches the windowID up to the first underscore.
+    # (.+) greedily matches the accessionID (which may contain underscores).
+    pattern = re.compile(r'^[^_]+_(.+)_(\d+)_(\d+)_([+-])$')
 
     for idx, row in df.iterrows():
         sample_name = str(row['SampleName'])
-        parts = sample_name.split(", ", 1)
-        if len(parts) != 2:
-            logging.warning(f"Row {idx} in {csv_path.name}: Invalid SampleName format '{sample_name}'")
-            continue
 
-        match = pattern.match(parts[1])
+        match = pattern.match(sample_name)
         if not match:
-            logging.warning(f"Row {idx} in {csv_path.name}: Regex failed on '{parts[1]}'")
+            logging.warning(f"Row {idx} in {csv_path.name}: Regex failed on SampleName '{sample_name}'")
             continue
 
-        _, win_start, win_end, strand = match.groups()
+        win_accession, win_start, win_end, strand = match.groups()
         valid_rows.append({
             'win_start': int(win_start),
             'win_end': int(win_end),
