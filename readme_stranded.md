@@ -55,11 +55,10 @@ pip install numpy pandas biopython intervaltree matplotlib
 
 Each record ID must follow the pattern:
 
-```         
-text
+```text
+`{accession}_{raw_start}-{raw_end}`
 ```
 
-`{accession}_{raw_start}-{raw_end}`
 
 Strand is inferred from coordinate order:
 
@@ -70,12 +69,10 @@ Strand is inferred from coordinate order:
 
 Examples:
 
-```         
-text
-```
-
-`>CP043804_723996-724438    # forward strand
+```text
+>CP043804_723996-724438    # forward strand
 >CP043804_724236-724198    # reverse strand (start > end)`
+```
 
 > **Important: If all your FASTA coordinates are written low→high regardless\
 > of strand, all records will be inferred as `+`. Reverse-strand entries must\
@@ -85,14 +82,11 @@ text
 
 Expected directory layout:
 
-```         
-text
-```
-
+```text
 `<mean_root>/
   <ACCESSION>/
     <ACCESSION>_mean.csv`
-
+```
 Each CSV must contain at minimum:
 
 | **Column** | **Description** |
