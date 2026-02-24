@@ -98,10 +98,7 @@ Each CSV must contain at minimum:
 
 ## **Usage**
 
-```         
-bash
-```
-
+```bash
 `python btf_coverage.py \
   --query-fasta    regions.fa \
   --mean-root      /path/to/btf_output/ \
@@ -112,7 +109,7 @@ bash
   --debug-dir      debug/ \
   --out-prefix     results/coverage \
   --plot`
-
+```
 ## **All arguments**
 
 | **Argument** | **Default** | **Description** |
