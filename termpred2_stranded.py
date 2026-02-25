@@ -539,11 +539,12 @@ def main():
                 if subj_len is None:
                     for cand in candidates:
                         try:
-                            subj_len         = blastdb_length(args.blastdbcmd, args.blast_db, cand)
+                            subj_len = blastdb_length(args.blastdbcmd, args.blast_db, cand)
                             length_cache[cand] = subj_len
                             blast_entry_used = cand
                             break
-                        except Exception:
+                        except Exception as exc:
+                            logging.debug("blastdbcmd failed for %r: %s", cand, exc)
                             continue
                 if subj_len is None:
                     note = f"blastdbcmd length lookup failed for candidates={candidates}"
