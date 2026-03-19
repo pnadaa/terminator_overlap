@@ -17,14 +17,20 @@ New probability-focused plot:
 
 import argparse
 import logging
+import multiprocessing as mp
+import os
 import re
 import subprocess
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from Bio import SeqIO
-from intervaltree import Interval, IntervalTree
+from intervaltree import IntervalTree
+
+
+_WORKER_STATE = {}
 
 
 # ---------------------------------------------------------------------------
@@ -39,6 +45,28 @@ def run_cmd(cmd, *, text=True):
             f"STDERR:\n{p.stderr}\nSTDOUT:\n{p.stdout}"
         )
     return p.stdout
+
+def get_available_cpus() -> int:
+    """
+    Resolve available CPU count for the current process in priority order:
+      1. PBS_NCPUS env var (set by PBS/Torque, most explicit)
+      2. os.sched_getaffinity (Linux kernel affinity mask)
+      3. os.cpu_count() (total node CPUs, last resort)
+    """
+    pbs_ncpus = os.environ.get("PBS_NCPUS") or os.environ.get("NCPUS")
+    if pbs_ncpus:
+        try:
+            return int(pbs_ncpus)
+        except ValueError:
+            pass
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            n = len(os.sched_getaffinity(0))
+            if n > 0:
+                return n
+        except OSError:
+            pass
+    return os.cpu_count() or 1
 
 
 def normalise_accession(acc: str) -> str:
@@ -55,6 +83,34 @@ def prefer_dot1_candidates(genome_id: str):
     return [f"{g}.1", g]
 
 
+def resolve_mean_csv(acc_raw: str, mean_root: Path, mean_suffix: str):
+    mean_tried = []
+    for g in prefer_dot1_candidates(acc_raw):
+        for candidate_suffix in [mean_suffix, mean_suffix + ".gz"]:
+            p = mean_root / g / f"{g}{candidate_suffix}"
+            mean_tried.append(str(p))
+            if p.exists():
+                return {
+                    "genome_key_used": g,
+                    "mean_csv": p,
+                    "mean_tried": mean_tried,
+                }
+    return {
+        "genome_key_used": None,
+        "mean_csv": None,
+        "mean_tried": mean_tried,
+    }
+
+
+def blastdb_length(blastdbcmd: str, blast_db: str, entry: str) -> int:
+    cmd = [blastdbcmd, "-db", blast_db, "-entry", entry, "-outfmt", "%l"]
+    out = run_cmd(cmd).strip()
+    try:
+        return int(out)
+    except ValueError:
+        raise RuntimeError(f"Could not parse blastdbcmd length for entry={entry!r}: {out!r}")
+
+
 # ---------------------------------------------------------------------------
 # Parsing
 # ---------------------------------------------------------------------------
@@ -64,8 +120,8 @@ def parse_fasta_coord_id(record_id: str):
     Parse FASTA ID: {accession}_{start}-{end}
 
     Strand is inferred from raw coordinate order:
-    raw_start <= raw_end -> '+'
-    raw_start > raw_end  -> '-'
+      raw_start <= raw_end -> '+'
+      raw_start > raw_end  -> '-'
 
     Returns: (acc, start, end, strand) with start <= end
     """
@@ -88,8 +144,8 @@ def parse_fasta_coord_id(record_id: str):
 def parse_window_samplename(sample_name: str):
     """
     Supports:
-    window_genome_low_high
-    window_genome_low_high_strand
+      window_genome_low_high
+      window_genome_low_high_strand
 
     Returns: (window_id, genome, start, end, strand_or_None)
     """
@@ -134,10 +190,10 @@ def load_positive_windows(
     probability_mean >= threshold.
 
     Returns:
-    trees : dict {'+': IntervalTree, '-': IntervalTree}
-    total_bp : dict {'+': int, '-': int}
-    kept_rows : int
-    kept_minmax : (min_coord, max_coord)
+      trees       : dict {'+': IntervalTree, '-': IntervalTree}
+      total_bp    : dict {'+': int, '-': int}
+      kept_rows   : int
+      kept_minmax : (min_coord, max_coord)
     """
     df = pd.read_csv(mean_csv)
     if "SampleName" not in df.columns or "probability_mean" not in df.columns:
@@ -218,6 +274,47 @@ def load_positive_windows(
 
 
 # ---------------------------------------------------------------------------
+# NumPy-backed vectorized overlap (for random control)
+# ---------------------------------------------------------------------------
+
+def build_merged_arrays(merged_trees: dict, strand: str):
+    """Convert a merged IntervalTree strand to sorted NumPy arrays (begin, end exclusive)."""
+    ivs = sorted(merged_trees[strand], key=lambda iv: iv.begin)
+    if not ivs:
+        return np.empty((0,), dtype=np.int64), np.empty((0,), dtype=np.int64)
+    starts = np.array([iv.begin for iv in ivs], dtype=np.int64)
+    ends = np.array([iv.end for iv in ivs], dtype=np.int64)
+    return starts, ends
+
+
+def vectorized_overlap_bp(
+    iv_starts: np.ndarray,
+    iv_ends: np.ndarray,
+    r_starts: np.ndarray,
+    region_len: int,
+) -> np.ndarray:
+    """
+    Compute overlap_bp for all random starts simultaneously.
+
+    iv_starts, iv_ends : merged interval arrays, end-exclusive
+    r_starts           : (N,) int64 array of random region starts (1-based inclusive)
+    region_len         : region length in bp
+
+    Returns:
+      (N,) int64 array of total overlap bp per random placement
+    """
+    r_starts = np.asarray(r_starts, dtype=np.int64)
+    if region_len <= 0 or r_starts.size == 0 or iv_starts.size == 0:
+        return np.zeros(r_starts.shape[0], dtype=np.int64)
+
+    r_ends = r_starts + region_len
+    a0 = np.maximum(iv_starts[None, :], r_starts[:, None])
+    a1 = np.minimum(iv_ends[None, :], r_ends[:, None])
+    overlaps = np.maximum(0, a1 - a0).sum(axis=1)
+    return overlaps.astype(np.int64, copy=False)
+
+
+# ---------------------------------------------------------------------------
 # Overlap and probability metrics
 # ---------------------------------------------------------------------------
 
@@ -252,7 +349,7 @@ def get_raw_overlaps(raw_trees_by_strand: dict, query_strand: str, start_inclusi
 def compute_probability_metrics(raw_trees_by_strand: dict, query_strand: str, start_inclusive: int, end_inclusive: int):
     """
     Returns:
-    (n_windows, max_probability_mean, mean_probability_mean, median_probability_mean)
+      (n_windows, max_probability_mean, mean_probability_mean, median_probability_mean)
     """
     overlaps = get_raw_overlaps(raw_trees_by_strand, query_strand, start_inclusive, end_inclusive)
     if not overlaps:
@@ -293,7 +390,6 @@ def best_overlap_probability_window(
         "window_overlap_bp": 0,
         "window_overlap_frac": 0.0,
     }
-
     if region_len <= 0:
         return best
 
@@ -340,19 +436,6 @@ def best_overlap_probability_window(
 
 
 # ---------------------------------------------------------------------------
-# BLAST DB genome-length helper
-# ---------------------------------------------------------------------------
-
-def blastdb_length(blastdbcmd: str, blast_db: str, entry: str) -> int:
-    cmd = [blastdbcmd, "-db", blast_db, "-entry", entry, "-outfmt", "%l"]
-    out = run_cmd(cmd).strip()
-    try:
-        return int(out)
-    except ValueError:
-        raise RuntimeError(f"Could not parse blastdbcmd length for entry={entry!r}: {out!r}")
-
-
-# ---------------------------------------------------------------------------
 # Plotting
 # ---------------------------------------------------------------------------
 
@@ -367,7 +450,6 @@ def annotate_mean_and_median(ax, xloc, series, color_mean="darkgreen", color_med
     mean_v = float(vals.mean())
     median_v = float(vals.median())
 
-    # Use a small axis-relative nudge rather than a hardcoded pixel offset
     x_lo, x_hi = ax.get_xlim()
     nudge = 0.04 * (x_hi - x_lo)
 
@@ -376,7 +458,7 @@ def annotate_mean_and_median(ax, xloc, series, color_mean="darkgreen", color_med
         va="bottom", ha="left", color=color_mean, fontsize=8,
         clip_on=True,
     )
-    # Shift median slightly if values are very close to avoid collision
+
     va_median = "top" if abs(mean_v - median_v) > 0.005 else "bottom"
     ax.text(
         xloc + nudge, median_v, f"Median: {median_v:.3f}",
@@ -385,19 +467,20 @@ def annotate_mean_and_median(ax, xloc, series, color_mean="darkgreen", color_med
     )
 
 
-# Colour palette shared across both plots for consistency
 _PALETTE_OBS_RAND = {
     "Observed best window": "#4C72B0",
     "Random best window mean": "#DD8452",
 }
+
 _PALETTE_METRICS = {
-    "Mean overlap prob":    "#4C72B0",
-    "Median overlap prob":  "#55A868",
-    "Max overlap prob":     "#C44E52",
+    "Mean overlap prob": "#4C72B0",
+    "Median overlap prob": "#55A868",
+    "Max overlap prob": "#C44E52",
     "Best qualifying prob": "#8172B2",
 }
+
 _PALETTE_COV = {
-    "Observed":    "#4C72B0",
+    "Observed": "#4C72B0",
     "Random mean": "#DD8452",
 }
 
@@ -425,8 +508,10 @@ def write_new_plot(res_df: pd.DataFrame, out_prefix: Path, threshold: float, min
     ).copy()
 
     if validA.empty:
-        axA.text(0.5, 0.5, "No valid observed/random\nbest-window data", ha="center", va="center",
-                 transform=axA.transAxes)
+        axA.text(
+            0.5, 0.5, "No valid observed/random\nbest-window data",
+            ha="center", va="center", transform=axA.transAxes
+        )
         axA.set_axis_off()
     else:
         panelA = validA[
@@ -459,12 +544,13 @@ def write_new_plot(res_df: pd.DataFrame, out_prefix: Path, threshold: float, min
                 color="grey", alpha=0.35, linewidth=0.6,
             )
 
-        # Annotations drawn after strips so xlim is settled
         annotate_mean_and_median(axA, 0, validA["best_overlap_probability_mean"])
         annotate_mean_and_median(axA, 1, validA["random_best_probability_mean_mean"])
 
-        axA.axhline(threshold, linestyle="--", color="black", linewidth=1,
-                    label=f"Threshold ({threshold})")
+        axA.axhline(
+            threshold, linestyle="--", color="black", linewidth=1,
+            label=f"Threshold ({threshold})"
+        )
         axA.legend(fontsize=8, loc="upper right")
         axA.set_xlabel("")
         axA.set_ylabel("Best qualifying window probability_mean")
@@ -473,7 +559,7 @@ def write_new_plot(res_df: pd.DataFrame, out_prefix: Path, threshold: float, min
         )
 
     # ------------------------------------------------------------------
-    # Panel B: Overlapping-window probability_mean summaries (violin)
+    # Panel B: Overlapping-window probability_mean summaries
     # ------------------------------------------------------------------
     axB = axes[1]
     validB = res_df.dropna(
@@ -481,18 +567,15 @@ def write_new_plot(res_df: pd.DataFrame, out_prefix: Path, threshold: float, min
     ).copy()
 
     if validB.empty:
-        axB.text(0.5, 0.5, "No overlapping-window\nprobability_mean data", ha="center", va="center",
-                 transform=axB.transAxes)
+        axB.text(
+            0.5, 0.5, "No overlapping-window\nprobability_mean data",
+            ha="center", va="center", transform=axB.transAxes
+        )
         axB.set_axis_off()
     else:
         panelB = validB[
-            [
-                "qseqid",
-                "mean_probability_mean",
-                "median_probability_mean",
-                "max_probability_mean",
-                "best_overlap_probability_mean",
-            ]
+            ["qseqid", "mean_probability_mean", "median_probability_mean",
+             "max_probability_mean", "best_overlap_probability_mean"]
         ].melt(
             id_vars="qseqid",
             value_vars=[
@@ -511,7 +594,6 @@ def write_new_plot(res_df: pd.DataFrame, out_prefix: Path, threshold: float, min
             "best_overlap_probability_mean": "Best qualifying prob",
         })
 
-        # Use violin for better density visibility; fall back to box+strip when n is too small
         n_per_metric = panelB.groupby("Metric")["ProbabilityMean"].count().min()
         if n_per_metric >= 5:
             sns.violinplot(
@@ -524,13 +606,16 @@ def write_new_plot(res_df: pd.DataFrame, out_prefix: Path, threshold: float, min
                 palette=_PALETTE_METRICS, width=0.55, showfliers=False, ax=axB,
                 boxprops=dict(alpha=0.35),
             )
-            sns.stripplot(
-                data=panelB, x="Metric", y="ProbabilityMean",
-                palette=_PALETTE_METRICS, alpha=0.6, jitter=0.12, size=3, ax=axB,
-            )
 
-        axB.axhline(threshold, linestyle="--", color="black", linewidth=1,
-                    label=f"Threshold ({threshold})")
+        sns.stripplot(
+            data=panelB, x="Metric", y="ProbabilityMean",
+            palette=_PALETTE_METRICS, alpha=0.6, jitter=0.12, size=3, ax=axB,
+        )
+
+        axB.axhline(
+            threshold, linestyle="--", color="black", linewidth=1,
+            label=f"Threshold ({threshold})"
+        )
         axB.legend(fontsize=8, loc="upper right")
         axB.set_xlabel("")
         axB.set_ylabel("probability_mean")
@@ -544,8 +629,10 @@ def write_new_plot(res_df: pd.DataFrame, out_prefix: Path, threshold: float, min
     validC = res_df.dropna(subset=["empirical_pvalue_best_overlap"]).copy()
 
     if validC.empty:
-        axC.text(0.5, 0.5, "No empirical p-values\n(random control unavailable)", ha="center", va="center",
-                 transform=axC.transAxes)
+        axC.text(
+            0.5, 0.5, "No empirical p-values\n(random control unavailable)",
+            ha="center", va="center", transform=axC.transAxes
+        )
         axC.set_axis_off()
     else:
         panelC = validC.sort_values("empirical_pvalue_best_overlap").copy()
@@ -564,12 +651,9 @@ def write_new_plot(res_df: pd.DataFrame, out_prefix: Path, threshold: float, min
             zorder=3,
         )
 
-        # Significance threshold line
         axC.axhline(-np.log10(0.05), linestyle="--", color="black", linewidth=1, label="p = 0.05")
-        # Secondary suggestive threshold
         axC.axhline(-np.log10(0.10), linestyle=":", color="grey", linewidth=0.8, label="p = 0.10")
 
-        # Annotate significant query IDs (up to 10 to avoid clutter)
         sig_rows = panelC[panelC["Significant"]].head(10)
         for _, r in sig_rows.iterrows():
             axC.annotate(
@@ -602,9 +686,9 @@ def write_new_plot(res_df: pd.DataFrame, out_prefix: Path, threshold: float, min
 
 def write_legacy_plot(res_df: pd.DataFrame, out_prefix: Path, threshold: float):
     import matplotlib
-    import matplotlib.pyplot as plt
     import matplotlib.cm as cm
     import matplotlib.colors as mcolors
+    import matplotlib.pyplot as plt
     import seaborn as sns
 
     matplotlib.rcParams.update({"font.family": "sans-serif", "font.sans-serif": ["Arial", "DejaVu Sans"]})
@@ -645,57 +729,60 @@ def write_legacy_plot(res_df: pd.DataFrame, out_prefix: Path, threshold: float):
             data=melted, x="Group", y="Coverage",
             palette=_PALETTE_COV, alpha=0.65, ax=axA, jitter=0.08,
         )
+
         for _, row in valid.iterrows():
             axA.plot(
                 [0, 1],
                 [row["percent_region_covered"], row["random_mean_percent"]],
                 color="grey", alpha=0.3, linewidth=0.5,
             )
+
         annotate_mean_and_median(axA, 0, valid["percent_region_covered"])
         annotate_mean_and_median(axA, 1, valid["random_mean_percent"])
         axA.set_xlabel("")
         axA.set_ylabel("Coverage (%)")
         axA.set_title("Legacy: observed vs random coverage")
 
-        # Panel B: coverage vs max probability — continuous colour scale
+        # Panel B: coverage vs max probability
         axB = axes[1]
         scatter_data = valid.dropna(subset=["max_probability_mean"]).copy()
-
-        norm = mcolors.Normalize(
-            vmin=scatter_data["percent_region_covered"].min(),
-            vmax=scatter_data["percent_region_covered"].max(),
-        )
-        cmap = cm.viridis
-        colors = cmap(norm(scatter_data["percent_region_covered"].values))
-
-        sc = axB.scatter(
-            scatter_data["max_probability_mean"],
-            scatter_data["percent_region_covered"],
-            c=scatter_data["percent_region_covered"],
-            cmap=cmap,
-            alpha=0.75,
-            s=40,
-            zorder=3,
-        )
-        cbar = fig.colorbar(sc, ax=axB, shrink=0.85)
-        cbar.set_label("Coverage (%)", fontsize=8)
-        axB.axvline(threshold, color="black", linestyle="--", label=f"Threshold ({threshold})")
-        axB.legend(fontsize=8)
-        axB.set_xlabel("Max probability_mean")
-        axB.set_ylabel("Coverage (%)")
-        axB.set_title("Legacy: coverage vs max probability")
+        if scatter_data.empty:
+            axB.text(0.5, 0.5, "No max probability data", ha="center", va="center", transform=axB.transAxes)
+        else:
+            norm = mcolors.Normalize(
+                vmin=scatter_data["percent_region_covered"].min(),
+                vmax=scatter_data["percent_region_covered"].max(),
+            )
+            cmap = cm.viridis
+            sc = axB.scatter(
+                scatter_data["max_probability_mean"],
+                scatter_data["percent_region_covered"],
+                c=scatter_data["percent_region_covered"],
+                cmap=cmap,
+                alpha=0.75,
+                s=40,
+                zorder=3,
+            )
+            cbar = fig.colorbar(sc, ax=axB, shrink=0.85)
+            cbar.set_label("Coverage (%)", fontsize=8)
+            axB.axvline(threshold, color="black", linestyle="--", label=f"Threshold ({threshold})")
+            axB.legend(fontsize=8)
+            axB.set_xlabel("Max probability_mean")
+            axB.set_ylabel("Coverage (%)")
+            axB.set_title("Legacy: coverage vs max probability")
 
         # Panel C: p-value histogram + KDE
         axC = axes[2]
         pvals = valid["empirical_pvalue_best_overlap"].dropna()
         if not pvals.empty:
-            sns.histplot(pvals, bins=20, binrange=(0, 1), ax=axC, color="skyblue",
-                         stat="density", kde=True, line_kws={"linewidth": 1.5})
+            sns.histplot(
+                pvals, bins=20, binrange=(0, 1), ax=axC, color="skyblue",
+                stat="density", kde=True, line_kws={"linewidth": 1.5}
+            )
             axC.axvline(0.05, color="black", linestyle="--", label="p = 0.05")
             axC.legend(fontsize=8)
         else:
-            axC.text(0.5, 0.5, "No p-values", ha="center", va="center",
-                     transform=axC.transAxes)
+            axC.text(0.5, 0.5, "No p-values", ha="center", va="center", transform=axC.transAxes)
         axC.set_xlabel("Empirical p-value")
         axC.set_ylabel("Density")
         axC.set_title("Legacy: p-value distribution")
@@ -708,6 +795,294 @@ def write_legacy_plot(res_df: pd.DataFrame, out_prefix: Path, threshold: float):
     fig.savefig(svg_path, bbox_inches="tight", facecolor="white")
     plt.close(fig)
     logging.info("Wrote legacy plot: %s (+ .svg)", legacy_path)
+
+
+# ---------------------------------------------------------------------------
+# Parallel worker state + per-query processing
+# ---------------------------------------------------------------------------
+
+def set_worker_state(state: dict):
+    global _WORKER_STATE
+    _WORKER_STATE = state
+
+
+def process_one_query(job):
+    state = _WORKER_STATE
+
+    index, qid, acc_raw, region_start, region_end, query_strand = job
+    region_len = region_end - region_start + 1
+    nanv = float("nan")
+
+    mean_resolution = state["mean_resolution_cache"][acc_raw]
+    genome_key_used = mean_resolution["genome_key_used"]
+    mean_csv = mean_resolution["mean_csv"]
+    mean_tried = mean_resolution["mean_tried"]
+
+    if mean_csv is None:
+        note = f"mean.csv not found for accession={acc_raw!r}"
+        result = {
+            "qseqid": qid,
+            "accession_from_fasta": acc_raw,
+            "region_start": region_start,
+            "region_end": region_end,
+            "query_strand": query_strand,
+            "region_len": region_len,
+            "genome_key_used": None,
+            "mean_csv": None,
+            "windows_rows_kept": None,
+            "windows_total_bp_this_strand": None,
+            "n_windows_above_threshold": None,
+            "max_probability_mean": nanv,
+            "mean_probability_mean": nanv,
+            "median_probability_mean": nanv,
+            "best_overlap_probability_mean": nanv,
+            "best_overlap_window_sample": None,
+            "best_overlap_window_start": None,
+            "best_overlap_window_end_inclusive": None,
+            "best_overlap_window_overlap_bp": None,
+            "best_overlap_window_overlap_frac": nanv,
+            "overlap_bp": 0,
+            "percent_region_covered": nanv,
+            "random_mean_percent": nanv,
+            "random_sd_percent": nanv,
+            "random_best_probability_mean_mean": nanv,
+            "random_best_probability_mean_median": nanv,
+            "random_best_probability_mean_sd": nanv,
+            "z_score": nanv,
+            "empirical_pvalue": nanv,
+            "empirical_pvalue_best_overlap": nanv,
+            "blast_entry_used": None,
+            "blast_entry_len": None,
+            "kept_window_min_coord": None,
+            "kept_window_max_coord": None,
+            "note": note,
+        }
+        debug = {
+            "qseqid": qid,
+            "accession": acc_raw,
+            "mean_paths_tried": ";".join(mean_tried),
+            "note": note,
+        }
+        mean_missing_row = {
+            "qseqid": qid,
+            "accession": acc_raw,
+            "mean_paths_tried": ";".join(mean_tried),
+        }
+        return {
+            "result": result,
+            "debug": debug,
+            "mean_missing_row": mean_missing_row,
+            "length_failed_row": None,
+            "overlap_window_rows": [],
+        }
+
+    merged_entry = state["merged_cache"][genome_key_used]
+    raw_trees_for_genome = state["raw_cache"][genome_key_used]
+
+    merged_trees = merged_entry["merged_trees"]
+    total_bp_by_strand = merged_entry["total_bp_by_strand"]
+    kept_rows = merged_entry["kept_rows"]
+    mean_csv_str = merged_entry["mean_csv_str"]
+    kept_min = merged_entry["kept_min"]
+    kept_max = merged_entry["kept_max"]
+    merged_arrays = merged_entry["merged_arrays"]
+
+    windows_total_bp = total_bp_by_strand.get(query_strand, 0)
+
+    ov = overlap_bp(merged_trees, query_strand, region_start, region_end)
+    percent_region_covered = 100.0 * ov / region_len if region_len > 0 else float("nan")
+
+    n_windows, max_prob, mean_prob, median_prob = compute_probability_metrics(
+        raw_trees_for_genome, query_strand, region_start, region_end
+    )
+
+    best_obs = best_overlap_probability_window(
+        raw_trees_for_genome,
+        query_strand,
+        region_start,
+        region_end,
+        min_overlap_frac=state["plot_min_window_overlap_frac"],
+    )
+
+    subj_len = None
+    blast_entry_used = None
+    note = ""
+    rand_percents = []
+    rand_best_probs = []
+    length_failed_row = None
+
+    random_n = state["random_n"]
+    if random_n > 0:
+        if state["blast_db"] is None:
+            note = "Random control disabled (no --blast-db provided)."
+        else:
+            len_info = state["length_resolution_cache"].get(acc_raw, {})
+            subj_len = len_info.get("subj_len")
+            blast_entry_used = len_info.get("blast_entry_used")
+
+            if subj_len is None:
+                candidates = len_info.get("candidates", prefer_dot1_candidates(acc_raw))
+                note = len_info.get("note") or f"blastdbcmd length lookup failed for candidates={candidates}"
+                length_failed_row = {
+                    "qseqid": qid,
+                    "accession": acc_raw,
+                    "candidates": ";".join(candidates),
+                }
+            elif subj_len >= region_len > 0:
+                max_start = subj_len - region_len + 1
+                rng = np.random.default_rng(args.seed) 
+                r_starts = rng.integers(1, max_start + 1, size=random_n, dtype=np.int64)
+
+                iv_starts, iv_ends = merged_arrays[query_strand]
+                rand_bp = vectorized_overlap_bp(iv_starts, iv_ends, r_starts, region_len)
+                rand_percents = (100.0 * rand_bp / region_len).astype(float).tolist()
+
+                for r_start in r_starts:
+                    r_start = int(r_start)
+                    r_end = r_start + region_len - 1
+                    best_rand = best_overlap_probability_window(
+                        raw_trees_for_genome,
+                        query_strand,
+                        r_start,
+                        r_end,
+                        min_overlap_frac=state["plot_min_window_overlap_frac"],
+                    )
+                    rand_best_probs.append(float(best_rand["probability_mean"]))
+            else:
+                note = (
+                    f"Genome length {subj_len} < region_len {region_len}; "
+                    "random control skipped."
+                )
+
+    if rand_percents:
+        arr_cov = np.array(rand_percents, dtype=float)
+        mean_r = float(np.mean(arr_cov))
+        sd_r = float(np.std(arr_cov, ddof=1)) if len(arr_cov) > 1 else 0.0
+    else:
+        mean_r = float("nan")
+        sd_r = float("nan")
+
+    if rand_best_probs:
+        arr_best = np.array(rand_best_probs, dtype=float)
+        rand_best_mean = float(np.mean(arr_best))
+        rand_best_median = float(np.median(arr_best))
+        rand_best_sd = float(np.std(arr_best, ddof=1)) if len(arr_best) > 1 else 0.0
+        obs_best_prob = float(best_obs["probability_mean"])
+        z_score = float((obs_best_prob - rand_best_mean) / rand_best_sd) if rand_best_sd > 0.0 else float("nan")
+        count_ge = int(np.sum(arr_best >= obs_best_prob))
+        empirical_pvalue = float((count_ge + 1) / (len(arr_best) + 1))
+    else:
+        rand_best_mean = float("nan")
+        rand_best_median = float("nan")
+        rand_best_sd = float("nan")
+        z_score = float("nan")
+        empirical_pvalue = float("nan")
+
+    result = {
+        "qseqid": qid,
+        "accession_from_fasta": acc_raw,
+        "region_start": region_start,
+        "region_end": region_end,
+        "query_strand": query_strand,
+        "region_len": region_len,
+        "genome_key_used": genome_key_used,
+        "mean_csv": mean_csv_str,
+        "windows_rows_kept": kept_rows,
+        "windows_total_bp_this_strand": windows_total_bp,
+        "n_windows_above_threshold": n_windows,
+        "max_probability_mean": max_prob,
+        "mean_probability_mean": mean_prob,
+        "median_probability_mean": median_prob,
+        "best_overlap_probability_mean": float(best_obs["probability_mean"]),
+        "best_overlap_window_sample": best_obs["window_sample"],
+        "best_overlap_window_start": best_obs["window_start"],
+        "best_overlap_window_end_inclusive": best_obs["window_end_inclusive"],
+        "best_overlap_window_overlap_bp": best_obs["window_overlap_bp"],
+        "best_overlap_window_overlap_frac": best_obs["window_overlap_frac"],
+        "overlap_bp": ov,
+        "percent_region_covered": percent_region_covered,
+        "random_mean_percent": mean_r,
+        "random_sd_percent": sd_r,
+        "random_best_probability_mean_mean": rand_best_mean,
+        "random_best_probability_mean_median": rand_best_median,
+        "random_best_probability_mean_sd": rand_best_sd,
+        "z_score": z_score,
+        "empirical_pvalue": empirical_pvalue,
+        "empirical_pvalue_best_overlap": empirical_pvalue,
+        "blast_entry_used": blast_entry_used,
+        "blast_entry_len": subj_len,
+        "kept_window_min_coord": kept_min,
+        "kept_window_max_coord": kept_max,
+        "note": note,
+    }
+
+    debug = {
+        "qseqid": qid,
+        "accession": acc_raw,
+        "region_start": region_start,
+        "region_end": region_end,
+        "query_strand": query_strand,
+        "region_len": region_len,
+        "genome_key_used": genome_key_used,
+        "mean_csv_used": mean_csv_str,
+        "mean_paths_tried": ";".join(mean_tried),
+        "kept_rows": kept_rows,
+        "kept_min_coord": kept_min,
+        "kept_max_coord": kept_max,
+        "windows_total_bp_this_strand": windows_total_bp,
+        "n_windows_above_threshold": n_windows,
+        "max_probability_mean": max_prob,
+        "mean_probability_mean": mean_prob,
+        "median_probability_mean": median_prob,
+        "best_overlap_probability_mean": float(best_obs["probability_mean"]),
+        "best_overlap_window_sample": best_obs["window_sample"],
+        "best_overlap_window_overlap_bp": best_obs["window_overlap_bp"],
+        "best_overlap_window_overlap_frac": best_obs["window_overlap_frac"],
+        "overlap_bp": ov,
+        "percent_region_covered": percent_region_covered,
+        "random_mean_percent": mean_r,
+        "random_best_probability_mean_mean": rand_best_mean,
+        "random_best_probability_mean_median": rand_best_median,
+        "z_score": z_score,
+        "empirical_pvalue_best_overlap": empirical_pvalue,
+        "blast_entry_used": blast_entry_used,
+        "blast_entry_len": subj_len,
+        "note": note,
+    }
+
+    overlap_window_rows = []
+    debug_max_overlap_windows = state["debug_max_overlap_windows"]
+    if debug_max_overlap_windows and debug_max_overlap_windows > 0:
+        raw_overlaps = get_raw_overlaps(raw_trees_for_genome, query_strand, region_start, region_end)
+        for iv in raw_overlaps[:debug_max_overlap_windows]:
+            d = iv.data or {}
+            ov_bp_single = interval_overlap_bp(iv.begin, iv.end, region_start, region_end)
+            ov_frac_single = ov_bp_single / region_len if region_len > 0 else float("nan")
+            qualifies = ov_frac_single > state["plot_min_window_overlap_frac"]
+            overlap_window_rows.append({
+                "qseqid": qid,
+                "genome_key_used": genome_key_used,
+                "region_start": region_start,
+                "region_end": region_end,
+                "query_strand": query_strand,
+                "window_start": iv.begin,
+                "window_end_inclusive": iv.end - 1,
+                "window_sample": d.get("SampleName"),
+                "window_probability_mean": d.get("probability_mean"),
+                "window_overlap_bp": ov_bp_single,
+                "window_overlap_frac": ov_frac_single,
+                "window_passes_best_overlap_filter": qualifies,
+                "window_genome_from_sample": d.get("Genome"),
+                "window_strand": d.get("Strand"),
+            })
+
+    return {
+        "result": result,
+        "debug": debug,
+        "mean_missing_row": None,
+        "length_failed_row": length_failed_row,
+        "overlap_window_rows": overlap_window_rows,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -761,8 +1136,24 @@ def main():
         default=1000,
         help="Random control iterations per query (default: 1000; set 0 to disable)",
     )
-    ap.add_argument("--seed", type=int, default=1, help="NumPy RNG seed (default: 1)")
-    ap.add_argument("--debug-dir", required=True, help="Directory for troubleshooting TSV outputs")
+    ap.add_argument(
+        "--seed", 
+        type=int,
+        default=1,
+        help="NumPy RNG seed (default: 1)"
+    )
+    ap.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of worker processes for per-query parallelism "
+             "(default: 1; use 0 for all available CPUs; Linux/fork recommended)",
+    )
+    ap.add_argument(
+        "--debug-dir",
+        required=True,
+        help="Directory for troubleshooting TSV outputs"
+    )
     ap.add_argument(
         "--debug-max-overlap-windows",
         type=int,
@@ -788,18 +1179,23 @@ def main():
             "to qualify for best-window probability scoring (default: 0.10)"
         ),
     )
-    ap.add_argument("--out-prefix", required=True, help="Output file prefix (TSV + optional PNG)")
+    ap.add_argument(
+        "--out-prefix", 
+        required=True, 
+        help="Output file prefix (TSV + optional PNG)"
+    )
     ap.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging verbosity",
     )
-
     args = ap.parse_args()
 
     if args.random_n < 0:
         raise ValueError("--random-n must be >= 0")
+    if args.workers < 0:
+        raise ValueError("--workers must be >= 0")
     if not (0.0 <= args.plot_min_window_overlap_frac < 1.0):
         raise ValueError("--plot-min-window-overlap-frac must be >= 0 and < 1")
 
@@ -807,8 +1203,6 @@ def main():
         level=getattr(logging, args.log_level),
         format="%(levelname)s: %(message)s",
     )
-
-    rng = np.random.default_rng(args.seed)
 
     mean_root = Path(args.mean_root)
     out_prefix = Path(args.out_prefix)
@@ -824,7 +1218,7 @@ def main():
     for rec in raw_records:
         try:
             acc_raw, region_start, region_end, query_strand = parse_fasta_coord_id(rec.id)
-            parsed_records.append((rec, acc_raw, region_start, region_end, query_strand))
+            parsed_records.append((rec.id, acc_raw, region_start, region_end, query_strand))
         except ValueError as exc:
             logging.warning("Skipping unparseable FASTA record %r: %s", rec.id, exc)
 
@@ -843,316 +1237,161 @@ def main():
             len(parsed_records), dominant,
         )
 
+    # ------------------------------------------------------------------
+    # Resolve mean CSVs per accession
+    # ------------------------------------------------------------------
+    unique_accessions = sorted({acc_raw for _, acc_raw, _, _, _ in parsed_records})
+    mean_resolution_cache = {
+        acc_raw: resolve_mean_csv(acc_raw, mean_root, args.mean_suffix)
+        for acc_raw in unique_accessions
+    }
+
+    # ------------------------------------------------------------------
+    # Pre-build interval trees and NumPy arrays per unique genome
+    # ------------------------------------------------------------------
     merged_cache = {}
     raw_cache = {}
-    length_cache = {}
 
+    genomes_to_build = {}
+    for acc_raw, resolution in mean_resolution_cache.items():
+        genome_key = resolution["genome_key_used"]
+        mean_csv = resolution["mean_csv"]
+        if genome_key is not None and mean_csv is not None and genome_key not in genomes_to_build:
+            genomes_to_build[genome_key] = mean_csv
+
+    if genomes_to_build:
+        logging.info("Pre-building interval-tree caches for %d unique genome(s).", len(genomes_to_build))
+
+    for genome_key_used, mean_csv in genomes_to_build.items():
+        merged_trees, total_bp_by_strand, kept_rows, kept_minmax = load_positive_windows(
+            mean_csv,
+            args.threshold,
+            genome_key_used,
+            merge=True,
+            keep_debug_data=False,
+            log_diagnostics=True,
+        )
+        merged_arrays = {
+            s: build_merged_arrays(merged_trees, s) for s in ("+", "-")
+        }
+        merged_cache[genome_key_used] = {
+            "merged_trees": merged_trees,
+            "total_bp_by_strand": total_bp_by_strand,
+            "kept_rows": kept_rows,
+            "mean_csv_str": str(mean_csv),
+            "kept_min": kept_minmax[0],
+            "kept_max": kept_minmax[1],
+            "merged_arrays": merged_arrays,
+        }
+
+        raw_trees, _, _, _ = load_positive_windows(
+            mean_csv,
+            args.threshold,
+            genome_key_used,
+            merge=False,
+            keep_debug_data=True,
+            log_diagnostics=False,
+        )
+        raw_cache[genome_key_used] = raw_trees
+
+    # ------------------------------------------------------------------
+    # Precompute genome lengths once per accession, if random control enabled
+    # ------------------------------------------------------------------
+    length_resolution_cache = {}
+    if args.random_n > 0 and args.blast_db is not None:
+        blast_length_cache = {}
+        logging.info("Precomputing BLAST genome lengths for %d accession(s).", len(unique_accessions))
+        for acc_raw in unique_accessions:
+            candidates = prefer_dot1_candidates(acc_raw)
+            subj_len = None
+            blast_entry_used = None
+            note = ""
+
+            for cand in candidates:
+                if cand in blast_length_cache:
+                    subj_len = blast_length_cache[cand]
+                    blast_entry_used = cand
+                    break
+
+            if subj_len is None:
+                for cand in candidates:
+                    try:
+                        subj_len = blastdb_length(args.blastdbcmd, args.blast_db, cand)
+                        blast_length_cache[cand] = subj_len
+                        blast_entry_used = cand
+                        break
+                    except Exception as exc:
+                        logging.debug("blastdbcmd failed for %r: %s", cand, exc)
+
+            if subj_len is None:
+                note = f"blastdbcmd length lookup failed for candidates={candidates}"
+
+            length_resolution_cache[acc_raw] = {
+                "subj_len": subj_len,
+                "blast_entry_used": blast_entry_used,
+                "note": note,
+                "candidates": candidates,
+            }
+
+    # ------------------------------------------------------------------
+    # Set worker state
+    # ------------------------------------------------------------------
+    worker_state = {
+        "merged_cache": merged_cache,
+        "raw_cache": raw_cache,
+        "mean_resolution_cache": mean_resolution_cache,
+        "length_resolution_cache": length_resolution_cache,
+        "seed": args.seed,
+        "random_n": args.random_n,
+        "blast_db": args.blast_db,
+        "plot_min_window_overlap_frac": args.plot_min_window_overlap_frac,
+        "debug_max_overlap_windows": args.debug_max_overlap_windows,
+    }
+    set_worker_state(worker_state)
+
+    jobs = [
+        (i, qid, acc_raw, region_start, region_end, query_strand)
+        for i, (qid, acc_raw, region_start, region_end, query_strand) in enumerate(parsed_records)
+    ]
+
+    # ------------------------------------------------------------------
+    # Run serial or parallel
+    # ------------------------------------------------------------------
     results = []
     debug_rows = []
     mean_missing_rows = []
     overlap_window_rows = []
     length_failed_rows = []
 
-    for rec, acc_raw, region_start, region_end, query_strand in parsed_records:
-        qid = rec.id
-        region_len = region_end - region_start + 1
-        mean_csv = None
-        genome_key_used = None
-        mean_tried = []
+    # AFTER
+    n_workers = args.workers if args.workers > 0 else get_available_cpus()
+    use_parallel = n_workers > 1 and len(jobs) > 1
 
-        for g in prefer_dot1_candidates(acc_raw):
-            for candidate_suffix in [args.mean_suffix, args.mean_suffix + ".gz"]:
-                p = mean_root / g / f"{g}{candidate_suffix}"
-                mean_tried.append(str(p))
-                if p.exists():
-                    genome_key_used = g
-                    mean_csv = p
-                    break
-            if mean_csv is not None:
-                break
+    outputs = []
+    if use_parallel:
+        try:
+            ctx = mp.get_context("fork")
+            logging.info("Processing %d query/queries with %d worker processes.", len(jobs), n_workers)
+            with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as pool:
+                outputs = list(pool.map(process_one_query, jobs, chunksize=1))
+        except ValueError:
+            logging.warning("fork start method unavailable; falling back to serial processing.")
+            outputs = [process_one_query(job) for job in jobs]
+    else:
+        outputs = [process_one_query(job) for job in jobs]
 
-        if mean_csv is None:
-            note = f"mean.csv not found for accession={acc_raw!r}"
-            nanv = float("nan")
-            results.append({
-                "qseqid": qid,
-                "accession_from_fasta": acc_raw,
-                "region_start": region_start,
-                "region_end": region_end,
-                "query_strand": query_strand,
-                "region_len": region_len,
-                "genome_key_used": None,
-                "mean_csv": None,
-                "windows_rows_kept": None,
-                "windows_total_bp_this_strand": None,
-                "n_windows_above_threshold": None,
-                "max_probability_mean": nanv,
-                "mean_probability_mean": nanv,
-                "median_probability_mean": nanv,
-                "best_overlap_probability_mean": nanv,
-                "best_overlap_window_sample": None,
-                "best_overlap_window_start": None,
-                "best_overlap_window_end_inclusive": None,
-                "best_overlap_window_overlap_bp": None,
-                "best_overlap_window_overlap_frac": nanv,
-                "overlap_bp": 0,
-                "percent_region_covered": nanv,
-                "random_mean_percent": nanv,
-                "random_sd_percent": nanv,
-                "random_best_probability_mean_mean": nanv,
-                "random_best_probability_mean_median": nanv,
-                "random_best_probability_mean_sd": nanv,
-                "z_score": nanv,
-                "empirical_pvalue": nanv,
-                "empirical_pvalue_best_overlap": nanv,
-                "blast_entry_used": None,
-                "blast_entry_len": None,
-                "kept_window_min_coord": None,
-                "kept_window_max_coord": None,
-                "note": note,
-            })
-            mean_missing_rows.append({
-                "qseqid": qid,
-                "accession": acc_raw,
-                "mean_paths_tried": ";".join(mean_tried),
-            })
-            debug_rows.append({
-                "qseqid": qid,
-                "accession": acc_raw,
-                "mean_paths_tried": ";".join(mean_tried),
-                "note": note,
-            })
-            continue
+    for out in outputs:
+        results.append(out["result"])
+        debug_rows.append(out["debug"])
+        if out["mean_missing_row"] is not None:
+            mean_missing_rows.append(out["mean_missing_row"])
+        if out["length_failed_row"] is not None:
+            length_failed_rows.append(out["length_failed_row"])
+        overlap_window_rows.extend(out["overlap_window_rows"])
 
-        if genome_key_used not in merged_cache:
-            merged_trees, total_bp_by_strand, kept_rows, kept_minmax = load_positive_windows(
-                mean_csv,
-                args.threshold,
-                genome_key_used,
-                merge=True,
-                keep_debug_data=False,
-                log_diagnostics=True,
-            )
-            merged_cache[genome_key_used] = (
-                merged_trees,
-                total_bp_by_strand,
-                kept_rows,
-                str(mean_csv),
-                kept_minmax,
-            )
-
-            raw_trees, _, _, _ = load_positive_windows(
-                mean_csv,
-                args.threshold,
-                genome_key_used,
-                merge=False,
-                keep_debug_data=True,
-                log_diagnostics=False,
-            )
-            raw_cache[genome_key_used] = raw_trees
-
-        merged_trees, total_bp_by_strand, kept_rows, mean_csv_str, (kept_min, kept_max) = merged_cache[genome_key_used]
-        raw_trees_for_genome = raw_cache[genome_key_used]
-        windows_total_bp = total_bp_by_strand.get(query_strand, 0)
-
-        ov = overlap_bp(merged_trees, query_strand, region_start, region_end)
-        percent_region_covered = 100.0 * ov / region_len if region_len > 0 else float("nan")
-
-        n_windows, max_prob, mean_prob, median_prob = compute_probability_metrics(
-            raw_trees_for_genome, query_strand, region_start, region_end
-        )
-
-        best_obs = best_overlap_probability_window(
-            raw_trees_for_genome,
-            query_strand,
-            region_start,
-            region_end,
-            min_overlap_frac=args.plot_min_window_overlap_frac,
-        )
-
-        subj_len = None
-        blast_entry_used = None
-        note = ""
-        rand_percents = []
-        rand_best_probs = []
-
-        if args.random_n > 0:
-            if args.blast_db is None:
-                note = "Random control disabled (no --blast-db provided)."
-            else:
-                candidates = prefer_dot1_candidates(acc_raw)
-
-                for cand in candidates:
-                    if cand in length_cache:
-                        subj_len = length_cache[cand]
-                        blast_entry_used = cand
-                        break
-
-                if subj_len is None:
-                    for cand in candidates:
-                        try:
-                            subj_len = blastdb_length(args.blastdbcmd, args.blast_db, cand)
-                            length_cache[cand] = subj_len
-                            blast_entry_used = cand
-                            break
-                        except Exception as exc:
-                            logging.debug("blastdbcmd failed for %r: %s", cand, exc)
-
-                if subj_len is None:
-                    note = f"blastdbcmd length lookup failed for candidates={candidates}"
-                    length_failed_rows.append({
-                        "qseqid": qid,
-                        "accession": acc_raw,
-                        "candidates": ";".join(candidates),
-                    })
-                elif subj_len >= region_len > 0:
-                    max_start = subj_len - region_len + 1
-                    r_starts = rng.integers(1, max_start + 1, size=args.random_n)
-
-                    for r_start in r_starts:
-                        r_start = int(r_start)
-                        r_end = r_start + region_len - 1
-
-                        rov = overlap_bp(merged_trees, query_strand, r_start, r_end)
-                        rand_percents.append(100.0 * rov / region_len)
-
-                        best_rand = best_overlap_probability_window(
-                            raw_trees_for_genome,
-                            query_strand,
-                            r_start,
-                            r_end,
-                            min_overlap_frac=args.plot_min_window_overlap_frac,
-                        )
-                        rand_best_probs.append(float(best_rand["probability_mean"]))
-                else:
-                    note = (
-                        f"Genome length {subj_len} < region_len {region_len}; "
-                        "random control skipped."
-                    )
-
-        if rand_percents:
-            arr_cov = np.array(rand_percents, dtype=float)
-            mean_r = float(np.mean(arr_cov))
-            sd_r = float(np.std(arr_cov, ddof=1)) if len(arr_cov) > 1 else 0.0
-        else:
-            mean_r = float("nan")
-            sd_r = float("nan")
-
-        if rand_best_probs:
-            arr_best = np.array(rand_best_probs, dtype=float)
-            rand_best_mean = float(np.mean(arr_best))
-            rand_best_median = float(np.median(arr_best))
-            rand_best_sd = float(np.std(arr_best, ddof=1)) if len(arr_best) > 1 else 0.0
-            obs_best_prob = float(best_obs["probability_mean"])
-            z_score = (
-                float((obs_best_prob - rand_best_mean) / rand_best_sd)
-                if rand_best_sd > 0.0 else float("nan")
-            )
-            count_ge = int(np.sum(arr_best >= obs_best_prob))
-            empirical_pvalue = float((count_ge + 1) / (len(arr_best) + 1))
-        else:
-            rand_best_mean = float("nan")
-            rand_best_median = float("nan")
-            rand_best_sd = float("nan")
-            z_score = float("nan")
-            empirical_pvalue = float("nan")
-
-        results.append({
-            "qseqid": qid,
-            "accession_from_fasta": acc_raw,
-            "region_start": region_start,
-            "region_end": region_end,
-            "query_strand": query_strand,
-            "region_len": region_len,
-            "genome_key_used": genome_key_used,
-            "mean_csv": mean_csv_str,
-            "windows_rows_kept": kept_rows,
-            "windows_total_bp_this_strand": windows_total_bp,
-            "n_windows_above_threshold": n_windows,
-            "max_probability_mean": max_prob,
-            "mean_probability_mean": mean_prob,
-            "median_probability_mean": median_prob,
-            "best_overlap_probability_mean": float(best_obs["probability_mean"]),
-            "best_overlap_window_sample": best_obs["window_sample"],
-            "best_overlap_window_start": best_obs["window_start"],
-            "best_overlap_window_end_inclusive": best_obs["window_end_inclusive"],
-            "best_overlap_window_overlap_bp": best_obs["window_overlap_bp"],
-            "best_overlap_window_overlap_frac": best_obs["window_overlap_frac"],
-            "overlap_bp": ov,
-            "percent_region_covered": percent_region_covered,
-            "random_mean_percent": mean_r,
-            "random_sd_percent": sd_r,
-            "random_best_probability_mean_mean": rand_best_mean,
-            "random_best_probability_mean_median": rand_best_median,
-            "random_best_probability_mean_sd": rand_best_sd,
-            "z_score": z_score,
-            "empirical_pvalue": empirical_pvalue,
-            "empirical_pvalue_best_overlap": empirical_pvalue,
-            "blast_entry_used": blast_entry_used,
-            "blast_entry_len": subj_len,
-            "kept_window_min_coord": kept_min,
-            "kept_window_max_coord": kept_max,
-            "note": note,
-        })
-
-        debug_rows.append({
-            "qseqid": qid,
-            "accession": acc_raw,
-            "region_start": region_start,
-            "region_end": region_end,
-            "query_strand": query_strand,
-            "region_len": region_len,
-            "genome_key_used": genome_key_used,
-            "mean_csv_used": mean_csv_str,
-            "mean_paths_tried": ";".join(mean_tried),
-            "kept_rows": kept_rows,
-            "kept_min_coord": kept_min,
-            "kept_max_coord": kept_max,
-            "windows_total_bp_this_strand": windows_total_bp,
-            "n_windows_above_threshold": n_windows,
-            "max_probability_mean": max_prob,
-            "mean_probability_mean": mean_prob,
-            "median_probability_mean": median_prob,
-            "best_overlap_probability_mean": float(best_obs["probability_mean"]),
-            "best_overlap_window_sample": best_obs["window_sample"],
-            "best_overlap_window_overlap_bp": best_obs["window_overlap_bp"],
-            "best_overlap_window_overlap_frac": best_obs["window_overlap_frac"],
-            "overlap_bp": ov,
-            "percent_region_covered": percent_region_covered,
-            "random_mean_percent": mean_r,
-            "random_best_probability_mean_mean": rand_best_mean,
-            "random_best_probability_mean_median": rand_best_median,
-            "z_score": z_score,
-            "empirical_pvalue_best_overlap": empirical_pvalue,
-            "blast_entry_used": blast_entry_used,
-            "blast_entry_len": subj_len,
-            "note": note,
-        })
-
-        if args.debug_max_overlap_windows and args.debug_max_overlap_windows > 0:
-            raw_overlaps = get_raw_overlaps(raw_trees_for_genome, query_strand, region_start, region_end)
-            for iv in raw_overlaps[: args.debug_max_overlap_windows]:
-                d = iv.data or {}
-                ov_bp_single = interval_overlap_bp(iv.begin, iv.end, region_start, region_end)
-                ov_frac_single = ov_bp_single / region_len if region_len > 0 else float("nan")
-                qualifies = ov_frac_single > args.plot_min_window_overlap_frac
-                overlap_window_rows.append({
-                    "qseqid": qid,
-                    "genome_key_used": genome_key_used,
-                    "region_start": region_start,
-                    "region_end": region_end,
-                    "query_strand": query_strand,
-                    "window_start": iv.begin,
-                    "window_end_inclusive": iv.end - 1,
-                    "window_sample": d.get("SampleName"),
-                    "window_probability_mean": d.get("probability_mean"),
-                    "window_overlap_bp": ov_bp_single,
-                    "window_overlap_frac": ov_frac_single,
-                    "window_passes_best_overlap_filter": qualifies,
-                    "window_genome_from_sample": d.get("Genome"),
-                    "window_strand": d.get("Strand"),
-                })
-
+    # ------------------------------------------------------------------
+    # Write outputs
+    # ------------------------------------------------------------------
     res_df = pd.DataFrame(results)
     res_path = out_prefix.with_suffix(".overlap.tsv")
     res_df.to_csv(res_path, sep="\t", index=False)
