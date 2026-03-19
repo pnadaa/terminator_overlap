@@ -430,11 +430,15 @@ def main():
         mean_csv        = None
         mean_tried      = []
         for g in prefer_dot1_candidates(acc_raw):
-            p = mean_root / g / f"{g}{args.mean_suffix}"
-            mean_tried.append(str(p))
-            if p.exists():
-                genome_key_used = g
-                mean_csv        = p
+            # First try the plain, then the gzipped suffix mean_csv
+            for candidate_suffix in [args.mean_suffix, args.mean_suffix + ".gz"]:
+                p = mean_root / g / f"{g}{candidate_suffix}"
+                mean_tried.append(str(p))
+                if p.exists():
+                    genome_key_used = g
+                    mean_csv        = p
+                    break
+            if mean_csv is not None:
                 break
 
         if mean_csv is None:
