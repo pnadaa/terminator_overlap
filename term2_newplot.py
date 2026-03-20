@@ -930,7 +930,7 @@ def process_one_query(job):
                 }
             elif subj_len >= region_len > 0:
                 max_start = subj_len - region_len + 1
-                rng = np.random.default_rng(args.seed) 
+                rng = np.random.default_rng(state["seed"] + index)
                 r_starts = rng.integers(1, max_start + 1, size=random_n, dtype=np.int64)
 
                 iv_starts, iv_ends = merged_arrays[query_strand]
