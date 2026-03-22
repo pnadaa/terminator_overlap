@@ -228,8 +228,8 @@ def load_positive_windows(
             data = {
                 "SampleName": sn,
                 "probability_mean": float(pm),
-                "Genome": genome_in_sn,
-                "Strand": strand,
+                "Genome": genome_in_sn,   # restore
+                "Strand": strand,          # restore
             }
 
         if strand is not None:
@@ -440,31 +440,26 @@ def best_overlap_probability_window(
 # ---------------------------------------------------------------------------
 
 def annotate_mean_and_median(ax, xloc, series, color_mean="darkgreen", color_median="firebrick"):
-    """
-    Annotate a categorical axis position with mean and median values.
-    Offset is computed from the current axis x-range to avoid clipping.
-    """
     vals = pd.Series(series).dropna().astype(float)
     if vals.empty:
         return
     mean_v = float(vals.mean())
     median_v = float(vals.median())
-
-    x_lo, x_hi = ax.get_xlim()
-    nudge = 0.04 * (x_hi - x_lo)
-
+    # Use blended transform: x in axes fraction, y in data coordinates
+    trans = ax.get_yaxis_transform()
+    offset = 0.02  # small fixed axes-fraction nudge
     ax.text(
-        xloc + nudge, mean_v, f"Mean: {mean_v:.3f}",
+        xloc + offset, mean_v, f"Mean: {mean_v:.3f}",
         va="bottom", ha="left", color=color_mean, fontsize=8,
-        clip_on=True,
+        clip_on=True, transform=trans,
+    )
+    va_median = "top" if abs(mean_v - median_v) > 0.02 else "bottom"
+    ax.text(
+        xloc + offset, median_v, f"Median: {median_v:.3f}",
+        va=va_median, ha="left", color=color_median, fontsize=8,
+        clip_on=True, transform=trans,
     )
 
-    va_median = "top" if abs(mean_v - median_v) > 0.005 else "bottom"
-    ax.text(
-        xloc + nudge, median_v, f"Median: {median_v:.3f}",
-        va=va_median, ha="left", color=color_median, fontsize=8,
-        clip_on=True,
-    )
 
 
 _PALETTE_OBS_RAND = {
@@ -485,7 +480,7 @@ _PALETTE_COV = {
 }
 
 
-def write_new_plot(res_df: pd.DataFrame, out_prefix: Path, threshold: float, min_overlap_frac: float):
+def write_new_plot(res_df: pd.DataFrame, out_prefix: Path, threshold: float, min_overlap_frac: float, random_n: int = 0):
     import matplotlib
     import matplotlib.pyplot as plt
     import seaborn as sns
@@ -528,20 +523,20 @@ def write_new_plot(res_df: pd.DataFrame, out_prefix: Path, threshold: float, min
         })
 
         sns.boxplot(
-            data=panelA, x="Group", y="ProbabilityMean",
-            palette=_PALETTE_OBS_RAND, width=0.45, showfliers=False, ax=axA,
+            data=panelA, x="Group", y="ProbabilityMean", hue="Group",
+            palette=_PALETTE_OBS_RAND, legend=False, width=0.45, showfliers=False, ax=axA,
             boxprops=dict(alpha=0.35),
         )
         sns.stripplot(
-            data=panelA, x="Group", y="ProbabilityMean",
-            palette=_PALETTE_OBS_RAND, alpha=0.75, jitter=0.08, ax=axA,
+            data=panelA, x="Group", y="ProbabilityMean", hue="Group",
+            palette=_PALETTE_OBS_RAND, legend=False, alpha=0.75, jitter=0.08, ax=axA,
         )
 
         for _, row in validA.iterrows():
             axA.plot(
                 [0, 1],
                 [row["best_overlap_probability_mean"], row["random_best_probability_mean_mean"]],
-                color="grey", alpha=0.35, linewidth=0.6,
+                color="grey", alpha=0.10, linewidth=0.3,
             )
 
         annotate_mean_and_median(axA, 0, validA["best_overlap_probability_mean"])
@@ -554,8 +549,11 @@ def write_new_plot(res_df: pd.DataFrame, out_prefix: Path, threshold: float, min
         axA.legend(fontsize=8, loc="upper right")
         axA.set_xlabel("")
         axA.set_ylabel("Best qualifying window probability_mean")
+        n_zero = (validA["best_overlap_probability_mean"] == 0.0).sum()
         axA.set_title(
-            f"Observed vs random best window\n(qualifying overlap > {min_overlap_frac:.0%})"
+            f"Observed vs random best window\n"
+            f"(qualifying overlap > {min_overlap_frac:.0%}; "
+            f"n_no_overlap={n_zero})"
         )
 
     # ------------------------------------------------------------------
@@ -597,19 +595,19 @@ def write_new_plot(res_df: pd.DataFrame, out_prefix: Path, threshold: float, min
         n_per_metric = panelB.groupby("Metric")["ProbabilityMean"].count().min()
         if n_per_metric >= 5:
             sns.violinplot(
-                data=panelB, x="Metric", y="ProbabilityMean",
-                palette=_PALETTE_METRICS, inner="box", cut=0, ax=axB,
+                data=panelB, x="Metric", y="ProbabilityMean",  hue="Metric",
+                palette=_PALETTE_METRICS, legend=False, inner="box", cut=0, ax=axB,
             )
         else:
             sns.boxplot(
-                data=panelB, x="Metric", y="ProbabilityMean",
-                palette=_PALETTE_METRICS, width=0.55, showfliers=False, ax=axB,
+                data=panelB, x="Metric", y="ProbabilityMean", hue="Metric",
+                palette=_PALETTE_METRICS, legend=False, width=0.55, showfliers=False, ax=axB,
                 boxprops=dict(alpha=0.35),
             )
 
         sns.stripplot(
-            data=panelB, x="Metric", y="ProbabilityMean",
-            palette=_PALETTE_METRICS, alpha=0.6, jitter=0.12, size=3, ax=axB,
+            data=panelB, x="Metric", y="ProbabilityMean",  hue="Metric",
+            palette=_PALETTE_METRICS, legend=False, alpha=0.6, jitter=0.12, size=3, ax=axB,
         )
 
         axB.axhline(
@@ -653,18 +651,26 @@ def write_new_plot(res_df: pd.DataFrame, out_prefix: Path, threshold: float, min
 
         axC.axhline(-np.log10(0.05), linestyle="--", color="black", linewidth=1, label="p = 0.05")
         axC.axhline(-np.log10(0.10), linestyle=":", color="grey", linewidth=0.8, label="p = 0.10")
-
-        sig_rows = panelC[panelC["Significant"]].head(10)
-        for _, r in sig_rows.iterrows():
-            axC.annotate(
-                str(r["qseqid"]),
-                xy=(r["rank"], r["neglog10_p"]),
-                xytext=(4, 2),
-                textcoords="offset points",
-                fontsize=6,
-                color="firebrick",
-                clip_on=True,
+        if random_n > 0:
+            min_detectable_p = 1.0 / (random_n + 1)
+            axC.axhline(
+                -np.log10(min_detectable_p), linestyle="-.",
+                color="purple", linewidth=1.0,
+                label=f"Min detectable p (n={random_n})",
             )
+
+
+        # sig_rows = panelC[panelC["Significant"]].head(10)
+        # for _, r in sig_rows.iterrows():
+        #     axC.annotate(
+        #         str(r["qseqid"]),
+        #         xy=(r["rank"], r["neglog10_p"]),
+        #         xytext=(4, 2),
+        #         textcoords="offset points",
+        #         fontsize=6,
+        #         color="firebrick",
+        #         clip_on=True,
+        #     )
 
         axC.grid(True, axis="y", alpha=0.3, linestyle="--", zorder=0)
         axC.set_xlabel(f"Query rank (n={len(panelC)})")
@@ -721,13 +727,13 @@ def write_legacy_plot(res_df: pd.DataFrame, out_prefix: Path, threshold: float):
         })
 
         sns.boxplot(
-            data=melted, x="Group", y="Coverage",
-            palette=_PALETTE_COV, ax=axA, showfliers=False, width=0.4,
+            data=melted, x="Group", y="Coverage", hue="Group",
+            palette=_PALETTE_COV, legend=False, ax=axA, showfliers=False, width=0.4,
             boxprops=dict(alpha=0.35),
         )
         sns.stripplot(
-            data=melted, x="Group", y="Coverage",
-            palette=_PALETTE_COV, alpha=0.65, ax=axA, jitter=0.08,
+            data=melted, x="Group", y="Coverage", hue="Group",
+            palette=_PALETTE_COV, legend=False, alpha=0.65, ax=axA, jitter=0.08,
         )
 
         for _, row in valid.iterrows():
@@ -1084,6 +1090,41 @@ def process_one_query(job):
         "overlap_window_rows": overlap_window_rows,
     }
 
+def process_genome_jobs(args_tuple):
+    """
+    Top-level worker function: loads one genome's trees then processes
+    all of its queries. Runs entirely inside the worker process.
+    """
+    genome_key, mean_csv_str, genome_jobs, shared_state = args_tuple
+    mean_csv = Path(mean_csv_str)
+
+    merged_trees, total_bp_by_strand, kept_rows, kept_minmax = load_positive_windows(
+        mean_csv, shared_state["coverage_threshold"], genome_key,
+        merge=True, keep_debug_data=False, log_diagnostics=False,
+    )
+    merged_arrays = {s: build_merged_arrays(merged_trees, s) for s in ("+", "-")}
+    merged_entry = {
+        "merged_trees": merged_trees,
+        "total_bp_by_strand": total_bp_by_strand,
+        "kept_rows": kept_rows,
+        "mean_csv_str": mean_csv_str,
+        "kept_min": kept_minmax[0],
+        "kept_max": kept_minmax[1],
+        "merged_arrays": merged_arrays,
+    }
+
+    raw_trees, _, _, _ = load_positive_windows(
+        mean_csv, shared_state["probability_threshold"], genome_key,
+        merge=False, keep_debug_data=True, log_diagnostics=False,
+    )
+
+    local_state = dict(shared_state)
+    local_state["merged_cache"] = {genome_key: merged_entry}
+    local_state["raw_cache"]    = {genome_key: raw_trees}
+    set_worker_state(local_state)
+
+    return [process_one_query(job) for job in genome_jobs]
+
 
 # ---------------------------------------------------------------------------
 # Main
@@ -1115,10 +1156,16 @@ def main():
         help="Filename suffix for mean CSV files (default: _mean.csv)",
     )
     ap.add_argument(
-        "--threshold",
+        "--coverage-threshold",
         type=float,
         default=0.3,
-        help="probability_mean threshold (default: 0.3)",
+        help="probability_mean threshold for coverage/overlap_bp calculation (default: 0.3)",
+    )
+    ap.add_argument(
+        "--probability-threshold",
+        type=float,
+        default=0.0,
+        help="probability_mean threshold for raw probability metric queries (default: 0.0)",
     )
     ap.add_argument(
         "--blast-db",
@@ -1247,11 +1294,8 @@ def main():
     }
 
     # ------------------------------------------------------------------
-    # Pre-build interval trees and NumPy arrays per unique genome
+    # Build genome index (no trees loaded yet)
     # ------------------------------------------------------------------
-    merged_cache = {}
-    raw_cache = {}
-
     genomes_to_build = {}
     for acc_raw, resolution in mean_resolution_cache.items():
         genome_key = resolution["genome_key_used"]
@@ -1259,40 +1303,10 @@ def main():
         if genome_key is not None and mean_csv is not None and genome_key not in genomes_to_build:
             genomes_to_build[genome_key] = mean_csv
 
-    if genomes_to_build:
-        logging.info("Pre-building interval-tree caches for %d unique genome(s).", len(genomes_to_build))
-
-    for genome_key_used, mean_csv in genomes_to_build.items():
-        merged_trees, total_bp_by_strand, kept_rows, kept_minmax = load_positive_windows(
-            mean_csv,
-            args.threshold,
-            genome_key_used,
-            merge=True,
-            keep_debug_data=False,
-            log_diagnostics=True,
-        )
-        merged_arrays = {
-            s: build_merged_arrays(merged_trees, s) for s in ("+", "-")
-        }
-        merged_cache[genome_key_used] = {
-            "merged_trees": merged_trees,
-            "total_bp_by_strand": total_bp_by_strand,
-            "kept_rows": kept_rows,
-            "mean_csv_str": str(mean_csv),
-            "kept_min": kept_minmax[0],
-            "kept_max": kept_minmax[1],
-            "merged_arrays": merged_arrays,
-        }
-
-        raw_trees, _, _, _ = load_positive_windows(
-            mean_csv,
-            args.threshold,
-            genome_key_used,
-            merge=False,
-            keep_debug_data=True,
-            log_diagnostics=False,
-        )
-        raw_cache[genome_key_used] = raw_trees
+    logging.info(
+        "Will stream interval-tree caches for %d unique genome(s) (one at a time).",
+        len(genomes_to_build),
+    )
 
     # ------------------------------------------------------------------
     # Precompute genome lengths once per accession, if random control enabled
@@ -1306,13 +1320,11 @@ def main():
             subj_len = None
             blast_entry_used = None
             note = ""
-
             for cand in candidates:
                 if cand in blast_length_cache:
                     subj_len = blast_length_cache[cand]
                     blast_entry_used = cand
                     break
-
             if subj_len is None:
                 for cand in candidates:
                     try:
@@ -1322,10 +1334,8 @@ def main():
                         break
                     except Exception as exc:
                         logging.debug("blastdbcmd failed for %r: %s", cand, exc)
-
             if subj_len is None:
                 note = f"blastdbcmd length lookup failed for candidates={candidates}"
-
             length_resolution_cache[acc_raw] = {
                 "subj_len": subj_len,
                 "blast_entry_used": blast_entry_used,
@@ -1334,28 +1344,52 @@ def main():
             }
 
     # ------------------------------------------------------------------
-    # Set worker state
+    #     # ------------------------------------------------------------------
+    # Group jobs by genome
     # ------------------------------------------------------------------
-    worker_state = {
-        "merged_cache": merged_cache,
-        "raw_cache": raw_cache,
+    from collections import defaultdict
+
+    genome_to_jobs = defaultdict(list)
+    missing_jobs = []
+
+    all_jobs = [
+        (i, qid, acc_raw, region_start, region_end, query_strand)
+        for i, (qid, acc_raw, region_start, region_end, query_strand) in enumerate(parsed_records)
+    ]
+
+    for job in all_jobs:
+        _, _, acc_raw, _, _, _ = job
+        genome_key = mean_resolution_cache[acc_raw]["genome_key_used"]
+        if genome_key is None:
+            missing_jobs.append(job)
+        else:
+            genome_to_jobs[genome_key].append(job)
+
+    n_workers = args.workers if args.workers > 0 else get_available_cpus()
+
+    # Shared state passed to every worker — no trees (each worker loads its own)
+    shared_state = {
+        "merged_cache": {},
+        "raw_cache": {},
         "mean_resolution_cache": mean_resolution_cache,
         "length_resolution_cache": length_resolution_cache,
         "seed": args.seed,
         "random_n": args.random_n,
         "blast_db": args.blast_db,
+        "coverage_threshold": args.coverage_threshold,
+        "probability_threshold": args.probability_threshold,
         "plot_min_window_overlap_frac": args.plot_min_window_overlap_frac,
         "debug_max_overlap_windows": args.debug_max_overlap_windows,
     }
-    set_worker_state(worker_state)
 
-    jobs = [
-        (i, qid, acc_raw, region_start, region_end, query_strand)
-        for i, (qid, acc_raw, region_start, region_end, query_strand) in enumerate(parsed_records)
+    genome_batch_args = [
+        (genome_key, str(genomes_to_build[genome_key]), genome_jobs, shared_state)
+        for genome_key, genome_jobs in genome_to_jobs.items()
     ]
 
     # ------------------------------------------------------------------
-    # Run serial or parallel
+    # Run: genome-level parallelism
+    # Each worker loads one genome and processes all its queries
     # ------------------------------------------------------------------
     results = []
     debug_rows = []
@@ -1363,24 +1397,44 @@ def main():
     overlap_window_rows = []
     length_failed_rows = []
 
-    # AFTER
-    n_workers = args.workers if args.workers > 0 else get_available_cpus()
-    use_parallel = n_workers > 1 and len(jobs) > 1
+    outputs_by_index = {}
 
-    outputs = []
-    if use_parallel:
+    # Handle no-CSV queries immediately in the main process
+    set_worker_state(shared_state)
+    for job in missing_jobs:
+        out = process_one_query(job)
+        outputs_by_index[job[0]] = out
+
+    logging.info(
+        "Processing %d genome batch(es) with %d worker(s).",
+        len(genome_batch_args), n_workers,
+    )
+
+    if n_workers > 1 and genome_batch_args:
+        # forkserver: workers fork from a clean server process,
+        # avoiding COW page-fault amplification of parent memory
         try:
-            ctx = mp.get_context("fork")
-            logging.info("Processing %d query/queries with %d worker processes.", len(jobs), n_workers)
-            with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as pool:
-                outputs = list(pool.map(process_one_query, jobs, chunksize=1))
+            ctx = mp.get_context("forkserver")
         except ValueError:
-            logging.warning("fork start method unavailable; falling back to serial processing.")
-            outputs = [process_one_query(job) for job in jobs]
-    else:
-        outputs = [process_one_query(job) for job in jobs]
+            ctx = mp.get_context("spawn")
 
-    for out in outputs:
+        with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as pool:
+            for (genome_key, _, genome_jobs, _), genome_outputs in zip(
+                genome_batch_args,
+                pool.map(process_genome_jobs, genome_batch_args, chunksize=1),
+            ):
+                for job, out in zip(genome_jobs, genome_outputs):
+                    outputs_by_index[job[0]] = out
+    else:
+        for args_tuple in genome_batch_args:
+            genome_key, _, genome_jobs, _ = args_tuple
+            genome_outputs = process_genome_jobs(args_tuple)
+            for job, out in zip(genome_jobs, genome_outputs):
+                outputs_by_index[job[0]] = out
+
+    # Restore original FASTA order
+    for i in range(len(all_jobs)):
+        out = outputs_by_index[i]
         results.append(out["result"])
         debug_rows.append(out["debug"])
         if out["mean_missing_row"] is not None:
@@ -1388,6 +1442,8 @@ def main():
         if out["length_failed_row"] is not None:
             length_failed_rows.append(out["length_failed_row"])
         overlap_window_rows.extend(out["overlap_window_rows"])
+
+
 
     # ------------------------------------------------------------------
     # Write outputs
@@ -1411,17 +1467,17 @@ def main():
 
     if args.plot:
         write_new_plot(
-            res_df,
-            out_prefix,
-            threshold=args.threshold,
+            res_df, out_prefix,
+            threshold=args.coverage_threshold,
             min_overlap_frac=args.plot_min_window_overlap_frac,
+            random_n=args.random_n,
         )
 
     if args.legacy_plot:
         write_legacy_plot(
             res_df,
             out_prefix,
-            threshold=args.threshold,
+            threshold=args.coverage_threshold,
         )
 
     logging.info("Wrote main results: %s", res_path)
