@@ -1220,10 +1220,10 @@ def main():
     ap.add_argument(
         "--plot-min-window-overlap-frac",
         type=float,
-        default=0.10,
+        default=0.99,
         help=(
             "Minimum fraction of the input sequence that a BacTermFinder window must overlap "
-            "to qualify for best-window probability scoring (default: 0.10)"
+            "to qualify for best-window probability scoring (default: 0.99)"
         ),
     )
     ap.add_argument(
