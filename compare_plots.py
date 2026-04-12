@@ -152,6 +152,48 @@ def build_parser() -> argparse.ArgumentParser:
         "-o", "--output", default="violin_plot.png",
         help="Output image path (.png / .pdf / .svg).",
     )
+    # ── New aesthetic controls ────────────────────────────────────────────────
+    vis.add_argument(
+        "--style",
+        choices=["paper", "talk", "poster", "dark"],
+        default="paper",
+        help=(
+            "Overall visual theme. "
+            "'paper' = minimal, publication-ready; "
+            "'talk' = larger text, bolder colours; "
+            "'poster' = very large text; "
+            "'dark' = dark background."
+        ),
+    )
+    vis.add_argument(
+        "--show-points", action="store_true", default=False,
+        help="Overlay jittered individual data points on each violin (default: off).",
+    )
+    vis.add_argument(
+        "--no-points", dest="show_points", action="store_false",
+        help="Suppress individual data-point overlay.",
+    )
+    vis.add_argument(
+        "--point-size",  type=float, default=3.5,
+        help="Diameter of individual data points in points².",
+    )
+    vis.add_argument(
+        "--point-alpha", type=float, default=0.55,
+        help="Opacity of individual data points (0–1).",
+    )
+    vis.add_argument(
+        "--violin-alpha", type=float, default=0.72,
+        help="Opacity of the violin body fill (0–1).",
+    )
+    vis.add_argument(
+        "--show-n", action="store_true", default=True,
+        help="Print sample size (n=…) under each group label (default: on).",
+    )
+    vis.add_argument(
+        "--no-n", dest="show_n", action="store_false",
+        help="Suppress sample-size labels.",
+    )
+
 
     # ── Statistics ────────────────────────────────────────────────────────────
     st = p.add_argument_group("Statistical tests")
@@ -756,6 +798,118 @@ def annotate_pairwise(
     ax.set_ylim(top=y_top + step * (level + 2.5))
 
 
+# ── Per-style theme tokens ─────────────────────────────────────────────────────
+_STYLE_CONFIG: dict[str, dict] = {
+    "paper": dict(
+        context="paper",
+        font_scale=1.15,
+        rc={
+            "axes.facecolor":   "#FAFAFA",
+            "figure.facecolor": "white",
+            "axes.edgecolor":   "#BBBBBB",
+            "axes.linewidth":   0.9,
+            "grid.color":       "#E4E4E4",
+            "grid.linewidth":   0.7,
+            "xtick.color":      "#333333",
+            "ytick.color":      "#333333",
+            "axes.spines.top":  False,
+            "axes.spines.right":False,
+            "font.family":      "sans-serif",
+        },
+        violin_lw=1.1,
+        box_lw=1.0,
+        cap_lw=1.4,
+        grid_axis="y",
+        grid_alpha=0.55,
+        bg_stripe=True,
+    ),
+    "talk": dict(
+        context="talk",
+        font_scale=1.0,
+        rc={
+            "axes.facecolor":   "white",
+            "figure.facecolor": "white",
+            "axes.edgecolor":   "#999999",
+            "axes.linewidth":   1.2,
+            "grid.color":       "#DDDDDD",
+            "grid.linewidth":   0.8,
+            "xtick.color":      "#222222",
+            "ytick.color":      "#222222",
+            "axes.spines.top":  False,
+            "axes.spines.right":False,
+            "font.family":      "sans-serif",
+        },
+        violin_lw=1.5,
+        box_lw=1.3,
+        cap_lw=1.8,
+        grid_axis="y",
+        grid_alpha=0.5,
+        bg_stripe=False,
+    ),
+    "poster": dict(
+        context="poster",
+        font_scale=1.0,
+        rc={
+            "axes.facecolor":   "white",
+            "figure.facecolor": "white",
+            "axes.edgecolor":   "#888888",
+            "axes.linewidth":   1.5,
+            "grid.color":       "#DDDDDD",
+            "grid.linewidth":   1.0,
+            "xtick.color":      "#111111",
+            "ytick.color":      "#111111",
+            "axes.spines.top":  False,
+            "axes.spines.right":False,
+            "font.family":      "sans-serif",
+        },
+        violin_lw=1.8,
+        box_lw=1.6,
+        cap_lw=2.2,
+        grid_axis="y",
+        grid_alpha=0.45,
+        bg_stripe=False,
+    ),
+    "dark": dict(
+        context="paper",
+        font_scale=1.15,
+        rc={
+            "axes.facecolor":   "#1C1C1E",
+            "figure.facecolor": "#111111",
+            "axes.edgecolor":   "#444444",
+            "axes.linewidth":   0.8,
+            "grid.color":       "#2E2E2E",
+            "grid.linewidth":   0.7,
+            "xtick.color":      "#CCCCCC",
+            "ytick.color":      "#CCCCCC",
+            "text.color":       "#EEEEEE",
+            "axes.labelcolor":  "#EEEEEE",
+            "axes.spines.top":  False,
+            "axes.spines.right":False,
+            "font.family":      "sans-serif",
+        },
+        violin_lw=1.1,
+        box_lw=1.0,
+        cap_lw=1.4,
+        grid_axis="y",
+        grid_alpha=0.6,
+        bg_stripe=False,
+    ),
+}
+
+
+def _apply_style(style_name: str) -> dict:
+    """Apply the seaborn theme and return the style token dict."""
+    cfg = _STYLE_CONFIG[style_name]
+    sns.set_theme(
+        context=cfg["context"],
+        style="ticks",
+        font_scale=cfg["font_scale"],
+        rc=cfg["rc"],
+    )
+    return cfg
+
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # VIOLIN PLOT
 # ══════════════════════════════════════════════════════════════════════════════
@@ -768,135 +922,204 @@ def make_violin_plot(
     stat_result: dict | None,
 ) -> plt.Figure:
     """
-    Build a publication-quality violin plot with:
-      • Seaborn violin (KDE density shape)
-      • Narrow box-and-whisker overlay
-      • Mean (filled circle) and median (white diamond) markers + numeric labels
-      • Pairwise significance brackets (when post-hoc results are available)
-      • Omnibus test result in a footer text box
+    Publication-quality violin plot featuring:
+      • Semi-transparent KDE violin body
+      • Alternating light column stripes (paper style)
+      • Jittered individual data points (optional)
+      • Elegant narrow box-and-whisker overlay
+      • Mean (◆ filled) and median (◇ open) markers with numeric labels
+      • n= sample-size tick sub-labels
+      • Pairwise significance brackets
+      • Omnibus test footer
     """
+    cfg     = _apply_style(args.style)
     n_groups = len(group_order)
     palette  = sns.color_palette(args.palette, n_colors=n_groups)
+    is_dark  = args.style == "dark"
+
+    # ── Per-style colours ──────────────────────────────────────────────────────
+    box_edge   = "#DDDDDD" if is_dark else "#2A2A2A"
+    cap_col    = "#CCCCCC" if is_dark else "#2A2A2A"
+    whisker_col= "#CCCCCC" if is_dark else "#444444"
+    flier_col  = "#888888" if is_dark else "#888888"
+    marker_text= "#BBBBBB" if is_dark else "#555555"
+    stat_text  = "#AAAAAA" if is_dark else "#444444"
+    bracket_col= "#CCCCCC" if is_dark else "#222222"
 
     fig, ax = plt.subplots(figsize=(args.width, args.height))
-    fig.patch.set_facecolor("white")
-    ax.set_facecolor("white")
+
+    # ── Subtle alternating column stripes (paper / talk only) ─────────────────
+    if cfg.get("bg_stripe"):
+        for xi in range(n_groups):
+            if xi % 2 == 0:
+                ax.axvspan(xi - 0.5, xi + 0.5, color="#F0F0F5", alpha=0.45, zorder=0)
+
+    # ── Horizontal grid ───────────────────────────────────────────────────────
+    ax.grid(
+        True,
+        axis="y",
+        linestyle="--",
+        linewidth=0.7,
+        color=cfg["rc"]["grid.color"],
+        alpha=cfg["grid_alpha"],
+        zorder=0,
+    )
+    ax.set_axisbelow(True)
 
     # ── Violin body ───────────────────────────────────────────────────────────
-    sns.violinplot(
+    vp = sns.violinplot(
         data=long,
         x="_group", y=column,
         order=group_order,
         palette=args.palette,
-        inner=None,          # manual overlays below give us full control
-        cut=0,               # do not extend beyond data range
+        inner=None,
+        cut=0,
         density_norm="width",
-        linewidth=1.4,
-        saturation=0.85,
+        linewidth=cfg["violin_lw"],
+        saturation=0.82,
         ax=ax,
     )
+    # Apply alpha to violin fills and soften the edge colour
+    for i, poly in enumerate(ax.collections):
+        if hasattr(poly, "get_paths") and len(poly.get_paths()) > 0:
+            poly.set_alpha(args.violin_alpha)
+            r, g_c, b, _ = poly.get_facecolor()[0]
+            poly.set_edgecolor((r * 0.65, g_c * 0.65, b * 0.65, 0.9))
+
+    # ── Jittered individual data points ───────────────────────────────────────
+    if args.show_points:
+        for xi, grp in enumerate(group_order):
+            vals = _group_vals(long, grp, column)
+            rng  = np.random.default_rng(seed=xi + 42)
+            jitter_x = xi + rng.uniform(-0.12, 0.12, size=len(vals))
+            r, g_c, b = palette[xi][:3]
+            ax.scatter(
+                jitter_x, vals,
+                s=args.point_size ** 2 * 0.55,
+                color=(r, g_c, b, args.point_alpha),
+                edgecolors=(r * 0.55, g_c * 0.55, b * 0.55, 0.7),
+                linewidths=0.35,
+                zorder=2,
+            )
 
     # ── Box-and-whisker overlay ───────────────────────────────────────────────
     sns.boxplot(
         data=long,
         x="_group", y=column,
         order=group_order,
-        width=0.16,
-        showfliers=True,
+        width=0.14,
+        showfliers=False,          # outliers already shown by stripplot
         showcaps=True,
-        boxprops    =dict(facecolor="white", edgecolor="#222222", linewidth=1.2, zorder=3),
-        whiskerprops=dict(color="#222222", linewidth=1.2, linestyle="-", zorder=3),
-        capprops    =dict(color="#222222", linewidth=1.8, zorder=3),
-        medianprops =dict(color="#222222", linewidth=0,   zorder=4),  # hidden; drawn below
-        flierprops  =dict(
-            marker="o", markerfacecolor="white",
-            markeredgecolor="#555555", markersize=3.5,
-            linewidth=0.8, zorder=3,
-        ),
+        boxprops    =dict(facecolor="white", edgecolor=box_edge,
+                          linewidth=cfg["box_lw"], zorder=4),
+        whiskerprops=dict(color=whisker_col,  linewidth=cfg["box_lw"],
+                          linestyle="-", zorder=4),
+        capprops    =dict(color=cap_col,      linewidth=cfg["cap_lw"], zorder=4),
+        medianprops =dict(color=box_edge,     linewidth=0, zorder=5),
         ax=ax,
     )
 
     # ── Mean & median markers + numeric labels ────────────────────────────────
-    y_vals   = long[column].dropna()
-    y_range  = y_vals.max() - y_vals.min()
-    lbl_off  = y_range * 0.022          # horizontal nudge for text labels
+    y_all   = long[column].dropna()
+    y_range = float(y_all.max() - y_all.min()) or 1.0
+    lbl_x_off = 0.48
 
-    for xi, g in enumerate(group_order):
-        vals     = _group_vals(long, g, column)
+    for xi, grp in enumerate(group_order):
+        vals     = _group_vals(long, grp, column)
         mean_v   = float(np.mean(vals))
         median_v = float(np.median(vals))
+        r, g_c, b = palette[xi][:3]
 
-        # Median – white diamond with black edge
+        # Median — white/dark diamond
         ax.scatter(
             xi, median_v,
-            marker="D", s=44,
-            color="white", edgecolors="#111111", linewidths=1.1,
+            marker="D", s=38,
+            color="white" if not is_dark else "#2A2A2A",
+            edgecolors=box_edge, linewidths=1.05,
             zorder=6,
         )
-        # Mean – filled coloured circle
+        # Mean — colour-filled circle
         ax.scatter(
             xi, mean_v,
-            marker="o", s=44,
-            color=palette[xi], edgecolors="#111111", linewidths=1.1,
+            marker="o", s=38,
+            color=(r, g_c, b, 1.0),
+            edgecolors=box_edge, linewidths=1.05,
             zorder=6,
         )
-        # Numeric labels (right of violin body)
-        label_x = xi + 0.52
-        ax.text(
-            label_x, median_v,
-            f"Mdn = {median_v:.3g}",
-            fontsize=7.2, va="center", color="#444444",
-            ha="left", clip_on=False,
-        )
-        ax.text(
-            label_x, mean_v,
-            f"M = {mean_v:.3g}",
-            fontsize=7.2, va="center", color="#444444",
-            ha="left", clip_on=False,
-        )
+        # Numeric labels
+        for y_val, prefix in ((median_v, "Mdn"), (mean_v, "M")):
+            ax.text(
+                xi + lbl_x_off, y_val,
+                f"{prefix} = {y_val:.3g}",
+                fontsize=6.8, va="center", ha="left",
+                color=marker_text, clip_on=False,
+            )
+
+    # ── n= sub-labels ─────────────────────────────────────────────────────────
+    if args.show_n:
+        current_xlabels = [grp for grp in group_order]
+        new_labels = []
+        for grp in group_order:
+            n = int((_group_vals(long, grp, column)).shape[0])
+            new_labels.append(f"{grp}\n$n={n}$")
+        ax.set_xticks(range(n_groups))
+        ax.set_xticklabels(new_labels, fontsize=9)
 
     # ── Significance brackets ─────────────────────────────────────────────────
     if stat_result and "posthoc_df" in stat_result:
         annotate_pairwise(
             ax, group_order, stat_result["posthoc_df"],
             args.alpha,
-            y_top   = float(y_vals.max()),
-            y_range = float(y_range),
+            y_top   = float(y_all.max()),
+            y_range = y_range,
         )
+        # Re-colour brackets for dark mode
+        for line in ax.lines[-50:]:
+            line.set_color(bracket_col)
 
-    # ── Axis / title cosmetics ────────────────────────────────────────────────
-    ax.set_xlabel("Group", fontsize=12, labelpad=6)
-    ax.set_ylabel(args.ylabel or column, fontsize=12, labelpad=6)
+    # ── Axis cosmetics ────────────────────────────────────────────────────────
+    ax.set_xlabel("Group", fontsize=11, labelpad=8,
+                  color=cfg["rc"].get("axes.labelcolor", "#333333"))
+    ax.set_ylabel(
+        args.ylabel or column, fontsize=11, labelpad=8,
+        color=cfg["rc"].get("axes.labelcolor", "#333333"),
+    )
     ax.set_title(
         args.title or f"Distribution of {column}",
-        fontsize=14, fontweight="semibold", pad=10,
+        fontsize=13, fontweight="semibold", pad=12,
+        color=cfg["rc"].get("text.color", "#111111"),
     )
-    ax.tick_params(axis="both", labelsize=10)
+    ax.tick_params(axis="both", which="both", length=3, width=0.8)
     sns.despine(ax=ax, trim=False)
 
     # ── Legend ────────────────────────────────────────────────────────────────
     legend_handles = [
-        mlines.Line2D(
-            [], [], marker="D", linestyle="None",
-            markerfacecolor="white", markeredgecolor="black",
-            markersize=7, label="Median",
-        ),
-        mlines.Line2D(
-            [], [], marker="o", linestyle="None",
-            markerfacecolor="gray", markeredgecolor="black",
-            markersize=7, label="Mean",
-        ),
+        mlines.Line2D([], [], marker="D", linestyle="None",
+                      markerfacecolor="white" if not is_dark else "#2A2A2A",
+                      markeredgecolor=box_edge, markersize=7, label="Median"),
+        mlines.Line2D([], [], marker="o", linestyle="None",
+                      markerfacecolor="gray", markeredgecolor=box_edge,
+                      markersize=7, label="Mean"),
     ]
+    if args.show_points:
+        legend_handles.append(
+            mlines.Line2D([], [], marker="o", linestyle="None",
+                          markerfacecolor=(0.5, 0.5, 0.5, 0.5),
+                          markeredgecolor="none", markersize=5,
+                          label="Individual observations")
+        )
     if stat_result and "posthoc_df" in stat_result:
         legend_handles.append(
-            mpatches.Patch(
-                color="none",
-                label="ns p≥0.05 | * p<0.05 | ** p<0.01 | *** p<0.001 | **** p<0.0001",
-            )
+            mpatches.Patch(color="none",
+                           label="ns  p≥0.05 | *  p<0.05 | **  p<0.01 | "
+                                 "***  p<0.001 | ****  p<0.0001")
         )
-    ax.legend(
+    leg = ax.legend(
         handles=legend_handles,
-        fontsize=7.8, framealpha=0.8, edgecolor="lightgray",
+        fontsize=7.2, framealpha=0.85,
+        edgecolor="#CCCCCC" if not is_dark else "#444444",
+        facecolor="white"  if not is_dark else "#1C1C1E",
+        labelcolor=cfg["rc"].get("text.color", "#333333"),
         loc="upper right",
     )
 
@@ -906,17 +1129,19 @@ def make_violin_plot(
             0.5, 0.005,
             stat_result["summary"],
             ha="center", va="bottom",
-            fontsize=7.5, color="#333333", style="italic",
-            wrap=True,
+            fontsize=7.2, color=stat_text, style="italic",
             bbox=dict(
-                boxstyle="round,pad=0.35",
-                facecolor="white", edgecolor="#cccccc", alpha=0.9,
+                boxstyle="round,pad=0.4",
+                facecolor="#1A1A1A" if is_dark else "white",
+                edgecolor="#444444" if is_dark else "#CCCCCC",
+                alpha=0.88,
             ),
         )
         plt.subplots_adjust(bottom=0.11)
 
     plt.tight_layout(rect=[0, 0.06, 1, 1])
     return fig
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
