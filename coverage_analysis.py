@@ -638,16 +638,38 @@ def write_new_plot(res_df: pd.DataFrame, out_prefix: Path, threshold: float, min
         panelC["neglog10_p"] = -np.log10(panelC["empirical_pvalue_best_overlap"])
         panelC["Significant"] = panelC["empirical_pvalue_best_overlap"] <= 0.05
 
-        sns.scatterplot(
-            data=panelC,
-            x="rank",
-            y="neglog10_p",
-            hue="Significant",
-            palette={True: "firebrick", False: "steelblue"},
-            s=45,
-            ax=axC,
+        sig_df    = panelC[panelC["Significant"]]
+        nonsig_df = panelC[~panelC["Significant"]]
+
+        # ── Non-significant: rasterized so 100k+ overlapping points don't
+        #    accumulate alpha and wash out. Rendered as a bitmap layer inside
+        #    the SVG — no transparency stacking, tiny file size. ──────────────
+        axC.scatter(
+            nonsig_df["rank"],
+            nonsig_df["neglog10_p"],
+            color="steelblue",
+            s=4,                   # small markers reduce apparent clutter
+            alpha=0.5,
+            linewidths=0,
+            label=f"Not significant (n={len(nonsig_df):,})",
+            rasterized=True,       # ← key fix: bitmap layer, no alpha accumulation
             zorder=3,
         )
+
+        # ── Significant: kept as crisp vectors on top ────────────────────────
+        if not sig_df.empty:
+            axC.scatter(
+                sig_df["rank"],
+                sig_df["neglog10_p"],
+                color="firebrick",
+                s=30,
+                alpha=1.0,
+                linewidths=0.4,
+                edgecolors="darkred",
+                label=f"Significant (n={len(sig_df):,})",
+                rasterized=False,  # vector — stays sharp at any zoom
+                zorder=4,
+            )
 
         axC.axhline(-np.log10(0.05), linestyle="--", color="black", linewidth=1, label="p = 0.05")
         axC.axhline(-np.log10(0.10), linestyle=":", color="grey", linewidth=0.8, label="p = 0.10")
@@ -659,21 +681,8 @@ def write_new_plot(res_df: pd.DataFrame, out_prefix: Path, threshold: float, min
                 label=f"Min detectable p (n={random_n})",
             )
 
-
-        # sig_rows = panelC[panelC["Significant"]].head(10)
-        # for _, r in sig_rows.iterrows():
-        #     axC.annotate(
-        #         str(r["qseqid"]),
-        #         xy=(r["rank"], r["neglog10_p"]),
-        #         xytext=(4, 2),
-        #         textcoords="offset points",
-        #         fontsize=6,
-        #         color="firebrick",
-        #         clip_on=True,
-        #     )
-
         axC.grid(True, axis="y", alpha=0.3, linestyle="--", zorder=0)
-        axC.set_xlabel(f"Query rank (n={len(panelC)})")
+        axC.set_xlabel(f"Query rank (n={len(panelC):,})")
         axC.set_ylabel("-log₁₀(empirical p-value)")
         axC.set_title("Empirical p-values from best-window randomisation")
         handles, labels = axC.get_legend_handles_labels()
@@ -685,7 +694,7 @@ def write_new_plot(res_df: pd.DataFrame, out_prefix: Path, threshold: float, min
     plot_path = out_prefix.with_suffix(".overlap.png")
     fig.savefig(plot_path, dpi=300, bbox_inches="tight", facecolor="white")
     svg_path = out_prefix.with_suffix(".overlap.svg")
-    fig.savefig(svg_path, bbox_inches="tight", facecolor="white")
+    fig.savefig(svg_path, bbox_inches="tight", facecolor="white", dpi=300)
     plt.close(fig)
     logging.info("Wrote new plot: %s (+ .svg)", plot_path)
 
